@@ -1,0 +1,20 @@
+# Sensitive
+config.py
+
+# Backtest artifacts
+backtest_results_*.json
+
+# Python
+__pycache__/
+*.pyc
+.python-version
+
+# Mac
+.DS_Store
+
+# Logs and DB
+logs/
+storage/
+
+# Docs (already added)
+*.md

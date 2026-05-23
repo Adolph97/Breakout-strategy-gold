@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  mt5:
+    image: gmag11/metatrader5_vnc:latest
+    container_name: mt5
+    ports:
+      - "3001:3000"    # VNC browser access (for initial broker login) - changed to 3001 to avoid conflict with Next.js on 3000
+      - "8001:8001"    # RPyC Python bridge to MT5
+    volumes:
+      - mt5_data:/config
+    environment: {}      # Explicit empty mapping
+    restart: unless-stopped
+
+  gold_trader:
+    build: .
+    container_name: gold_trader
+    ports:
+      - "5000:5000"    # TradingView webhook
+    volumes:
+      - trader_db:/app/storage
+    environment:
+      MT5_HOST: mt5   # Docker service name resolves to container IP
+      MT5_PORT: 8001
+      # Your trading bot configuration (can also be set in config.py)
+      # MIN_SCORE: 4
+      # LOT_SIZE: 0.01
+      # PAPER_TRADING: false
+    depends_on:
+      - mt5
+    restart: unless-stopped
+
+volumes:
+  mt5_data:
+    # Persists MT5 configuration, profiles, and broker login data
+  trader_db:
+    # Persists SQLite database for the trading bot
