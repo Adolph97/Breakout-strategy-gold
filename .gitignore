@@ -18,3 +18,4 @@ storage/
 
 # Docs (already added)
 *.md
+!README.md
