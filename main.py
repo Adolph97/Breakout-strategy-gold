@@ -10,22 +10,21 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import all modules
 import config
-from data.mt5_feed import get_tick, get_bars, initialize_mt5, shutdown_mt5
-from data.cot_feed import get_latest_cot_from_db, save_cot_to_db
+from data.price_feed import get_tick, get_bars
+from data.cot_feed import get_latest_cot_from_db
 from data.calendar_feed import get_latest_events_from_db
-from storage.db import init_database, log_trade, log_strategy_signal
+from storage.db import init_database, log_strategy_signal, get_db_connection
 from strategy.indicators import calculate_adx, calculate_atr, calculate_ema
 from strategy.scorer import score
 from signals.webhook_receiver import get_latest_signal
-from execution.mt5_executor import execute_trade
-from signals.telegram_notifier import send_signal_alert
+from signals.telegram_notifier import send_signal_alert, send_status_update
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/Users/konatech/Desktop/trading/gold_trader/logs/trades.log'),
+        logging.FileHandler('logs/trades.log'),
         logging.StreamHandler()
     ]
 )
@@ -37,78 +36,62 @@ def is_market_open():
     Check if forex market is open (simplified - XAUUSD trades 24/5)
     Returns True if Monday-Friday, not Saturday-Sunday
     """
-    # MT5 market hours: Sunday 5:00 PM EST to Friday 5:00 PM EST
-    # Simplified: weekday trading
     now = datetime.now(pytz.UTC)
     weekday = now.weekday()  # Monday=0, Sunday=6
     return weekday < 5  # Monday-Friday
 
-def update_weekly_data():
-    """
-    Update COT and calendar data weekly
-    This would typically be run by a separate scheduler, but we'll check timestamps
-    """
-    # For simplicity, we'll update if data is older than 6 days
-    # In production, you'd use a proper scheduler (cron, APScheduler, etc.)
-    pass  # Implementation would go here
-
 def main():
-    """Main trading loop"""
-    logger.info("Starting Gold Trader Bot")
+    """Main signal generation loop"""
+    logger.info("Starting Gold Trader Signal Bot (Signal-Only Mode)")
+    
+    # Send Startup Notification
+    send_status_update("STARTUP")
+    
     logger.info(f"Configuration: Symbol={config.SYMBOL}, Timeframe={config.TIMEFRAME}")
-    logger.info(f"Minimum score required: {config.MIN_SCORE}/6")
-    logger.info(f"Lot size: {config.LOT_SIZE}")
-    logger.info(f"Paper trading: {config.PAPER_TRADING}")
+    logger.info(f"Minimum score required for Telegram alert: {config.MIN_SCORE}/6")
 
     # Initialize database
     init_database()
 
-    # Initialize MT5 connection
-    if not initialize_mt5():
-        logger.error("Failed to initialize MT5. Exiting.")
-        return
-
-    logger.info("MT5 initialized successfully")
-
     try:
-        # Main trading loop
+        # Get a persistent database connection for the main loop
+        db_conn = get_db_connection()
+        
+        cycle_count = 0
+        # Main loop
         while True:
+            # Heartbeat every 60 cycles (roughly 1 hour)
+            if cycle_count % 60 == 0 and cycle_count > 0:
+                from signals.telegram_notifier import send_telegram_message
+                send_telegram_message("❤️ <b>Heartbeat:</b> Bot is still scanning Gold...")
+
             # Check if market is open
             if not is_market_open():
                 logger.info("Market is closed. Waiting...")
-                time.sleep(300)  # Check every 5 minutes when market is closed
+                time.sleep(300)
                 continue
 
-            logger.info("--- New trading cycle ---")
+            logger.info("--- New scanning cycle ---")
 
-            # Get market data
+            # Get market data (Simulation fallback used if MT5 not available)
             tick_data = get_tick()
-            bars_data = get_bars(count=100)  # Get last 100 bars for analysis
+            bars_data = get_bars(count=100)
 
             if not tick_data or bars_data is None:
                 logger.warning("Failed to get market data. Retrying...")
                 time.sleep(10)
                 continue
 
-            # Get supplemental data from database
-            cot_data = get_latest_cot_from_db()
-            news_data = get_latest_events_from_db()
+            # Get supplemental data
+            cot_data = get_latest_cot_from_db(db_conn)
+            news_data = get_latest_events_from_db(db_conn)
             webhook_signal = get_latest_signal()
 
-            # Log data for debugging
-            logger.info(f"Tick: {tick_data}")
-            logger.info(f"COT: {cot_data}")
-            logger.info(f"News: {news_data}")
-            logger.info(f"Webhook signal: {webhook_signal}")
-
-            # Calculate indicators for logging
+            # Calculate indicators
             adx = calculate_adx(bars_data)
             atr = calculate_atr(bars_data)
             ema_fast = calculate_ema(bars_data, period=9)
             ema_slow = calculate_ema(bars_data, period=21)
-
-            logger.info(f"Indicators - ADX: {adx:.2f if adx else None}, ATR: {atr:.4f if atr else None}")
-            logger.info(f"EMAs - Fast: {ema_fast:.2f if ema_fast else None}, Slow: {ema_slow:.2f if ema_slow else None}")
 
             # Calculate score
             result = score(
@@ -119,7 +102,7 @@ def main():
                 webhook_signal=webhook_signal.get('direction') if webhook_signal else None
             )
 
-            logger.info(f"Score result: {result}")
+            logger.info(f"Score result: {result['score']}/6 - Fire: {result['fire']}")
 
             # Log strategy signal for analysis
             log_strategy_signal(
@@ -129,59 +112,62 @@ def main():
                 atr=atr if atr else 0,
                 ema_fast=ema_fast if ema_fast else 0,
                 ema_slow=ema_slow if ema_slow else 0,
-                derivative_signal="TODO",  # Would need to extract from scorer
+                derivative_signal="N/A",
                 cot_bias=cot_data.get('bias') if cot_data else "NONE",
                 spread=tick_data.get('spread', 0),
-                news_clear=not news_data.get('high_impact_soon', True),
-                session_valid=True,  # Simplified - would check actual session
+                news_clear=not news_data.get('high_impact_soon', True) if news_data else True,
+                session_valid=True,
                 tv_signal=webhook_signal.get('direction') if webhook_signal else None,
                 total_score=result['score'],
                 fire_signal=result['fire']
             )
 
-            # Execute trade if score meets threshold
-            if result['fire'] and result['direction']:
-                logger.info(f"TRADE SIGNAL: {result['direction']} with score {result['score']}")
-                logger.info(f"Reasons: {', '.join(result['reasons'])}")
+            # Send Telegram alert if score meets threshold
+            if result['fire']:
+                logger.info(f"SIGNAL FIRED: {result['direction']} with score {result['score']}")
+                
+                # Format a mock trade_result for the Telegram alert (since we aren't executing)
+                mock_trade_result = {
+                    "success": True,
+                    "price": tick_data['ask'] if result['direction'] == "BUY" else tick_data['bid'],
+                    "sl": 0, 
+                    "tp": 0,
+                    "lot_size": 0,
+                    "ticket": "SIGNAL_ONLY"
+                }
+                
+                # If we want real SL/TP in the message, we can calculate them here
+                if atr:
+                    # Modular SL/TP calculation
+                    sl_multiplier = 1.5
+                    tp_multiplier = 3.0
+                    if result['direction'] == "BUY":
+                        mock_trade_result['sl'] = round(mock_trade_result['price'] - (atr * sl_multiplier), 2)
+                        mock_trade_result['tp'] = round(mock_trade_result['price'] + (atr * tp_multiplier), 2)
+                    else:
+                        mock_trade_result['sl'] = round(mock_trade_result['price'] + (atr * sl_multiplier), 2)
+                        mock_trade_result['tp'] = round(mock_trade_result['price'] - (atr * tp_multiplier), 2)
 
-                # Get Asian range width for dynamic position sizing
-                range_width = result.get('asian_range', {}).get('width') if result.get('asian_range') else None
-                if range_width:
-                    logger.info(f"Asian range width: ${range_width} for position sizing")
-
-                # Execute the trade
-                atr_value = atr if atr else 0.5  # Fallback ATR value
-                trade_result = execute_trade(result['direction'], atr_value, range_width)
-
-                # Send Telegram notification
-                send_signal_alert(result, trade_result)
-
-                if trade_result['success']:
-                    logger.info(f"Trade executed successfully: {trade_result}")
-
-                    # Update the trade log with actual score and reasons
-                    # In a real implementation, you'd update the database record
-                    logger.info("Trade logged to database")
-                else:
-                    logger.error(f"Trade execution failed: {trade_result}")
+                send_signal_alert(result, mock_trade_result)
             else:
-                logger.info("No trade signal - score below threshold or no direction")
+                logger.info("No signal meeting threshold.")
 
             # Wait before next cycle
             logger.info("--- End of cycle ---")
-            time.sleep(60)  # Check every minute
+            cycle_count += 1
+            time.sleep(60)
 
     except KeyboardInterrupt:
         logger.info("Received shutdown signal. Stopping bot...")
+        send_status_update("SHUTDOWN", "Manual interruption (Ctrl+C)")
     except Exception as e:
+        error_details = str(e)
         logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+        send_status_update("ERROR", error_details)
     finally:
-        # Cleanup
-        shutdown_mt5()
-        logger.info("MT5 connection closed. Bot stopped.")
+        if 'db_conn' in locals():
+            db_conn.close()
 
 if __name__ == "__main__":
-    # Create logs directory if it doesn't exist
-    os.makedirs('/Users/konatech/Desktop/trading/gold_trader/logs', exist_ok=True)
-
+    os.makedirs('logs', exist_ok=True)
     main()

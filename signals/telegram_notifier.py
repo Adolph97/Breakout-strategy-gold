@@ -2,6 +2,7 @@ import requests
 import logging
 import os
 import sys
+from datetime import datetime
 
 # Add project root to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,6 +38,24 @@ def send_telegram_message(message):
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
         return False
+
+def send_status_update(status_type, details=None):
+    """
+    Send a status update (Startup, Shutdown, Error) to Telegram.
+    """
+    if status_type == "STARTUP":
+        emoji = "🚀"
+        message = f"{emoji} <b>Gold Trader Bot Started</b>\nMode: Signal-Only\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    elif status_type == "SHUTDOWN":
+        emoji = "🛑"
+        message = f"{emoji} <b>Gold Trader Bot Offline</b>\nReason: {details if details else 'Manual stop or system signal'}"
+    elif status_type == "ERROR":
+        emoji = "⚠️"
+        message = f"{emoji} <b>CRITICAL ERROR</b>\nDetails: <code>{details}</code>"
+    else:
+        return False
+
+    return send_telegram_message(message)
 
 def send_signal_alert(result, trade_result=None):
     """

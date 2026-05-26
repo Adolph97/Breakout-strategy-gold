@@ -12,10 +12,10 @@ def get_derivative_signal(df):
         Tuple of (String: "BUY", "SELL", or None, dict or None)
     """
     # Primary strategy: Asian Range Breakout
-    signal, asian_range = asian_range.get_asian_range_signal(df)
-    if signal:
-        logging.info(f"Asian range signal: {signal}, width: {asian_range['width']}")
-        return signal, asian_range
+    ar_signal, ar_data = asian_range.get_asian_range_signal(df)
+    if ar_signal:
+        logging.info(f"Asian range signal: {ar_signal}, width: {ar_data['width']}")
+        return ar_signal, ar_data
 
     # Fallback: Keep the old liquidity sweep/pullback logic as backup
     fallback_signal = _get_legacy_derivative_signal(df)
