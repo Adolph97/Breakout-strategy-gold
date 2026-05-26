@@ -2,7 +2,7 @@ import time
 import logging
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
 # Add project root to path
@@ -15,7 +15,7 @@ from data.cot_feed import get_latest_cot_from_db
 from data.calendar_feed import get_latest_events_from_db
 from storage.db import init_database, log_strategy_signal, get_db_connection
 from strategy.indicators import calculate_adx, calculate_atr, calculate_ema
-from strategy.scorer import score
+from strategy.scorer import score, is_valid_session
 from signals.webhook_receiver import get_latest_signal
 from signals.telegram_notifier import send_signal_alert, send_status_update
 
@@ -42,6 +42,15 @@ def is_market_open():
 
 def main():
     """Main signal generation loop"""
+    # --- CONFIGURATION ---
+    SCAN_INTERVAL = 300   # Scan every 5 minutes
+    HEARTBEAT_CYCLES = 12 # Heartbeat every hour
+    
+    # SIGNAL LOCK: Prevents duplicate alerts for the same direction within 4 hours
+    COOLDOWN_PERIOD = timedelta(hours=4)
+    last_signal_time = {"BUY": None, "SELL": None}
+    # ---------------------
+
     logger.info("Starting Gold Trader Signal Bot (Signal-Only Mode)")
     
     # Send Startup Notification
@@ -49,6 +58,7 @@ def main():
     
     logger.info(f"Configuration: Symbol={config.SYMBOL}, Timeframe={config.TIMEFRAME}")
     logger.info(f"Minimum score required for Telegram alert: {config.MIN_SCORE}/6")
+    logger.info(f"Scan Interval: {SCAN_INTERVAL} seconds")
 
     # Initialize database
     init_database()
@@ -60,25 +70,31 @@ def main():
         cycle_count = 0
         # Main loop
         while True:
-            # Heartbeat every 60 cycles (roughly 1 hour)
-            if cycle_count % 60 == 0 and cycle_count > 0:
+            # Heartbeat every hour
+            if cycle_count % HEARTBEAT_CYCLES == 0 and cycle_count > 0:
                 from signals.telegram_notifier import send_telegram_message
                 send_telegram_message("❤️ <b>Heartbeat:</b> Bot is still scanning Gold...")
 
-            # Check if market is open
+            # 1. Market Open Check (Weekends)
             if not is_market_open():
                 logger.info("Market is closed. Waiting...")
-                time.sleep(300)
+                time.sleep(600)
+                continue
+
+            # 2. STRICT SESSION LOCK (Only trade London/NY)
+            if not is_valid_session():
+                logger.info("Outside valid trading sessions (London/NY). Scanning suspended.")
+                time.sleep(SCAN_INTERVAL)
                 continue
 
             logger.info("--- New scanning cycle ---")
 
-            # Get market data (Simulation fallback used if MT5 not available)
+            # Get market data (Binance Live Feed)
             tick_data = get_tick()
             bars_data = get_bars(count=100)
 
             if not tick_data or bars_data is None:
-                logger.warning("Failed to get market data. Retrying...")
+                logger.warning("Failed to get market data. Retrying in 10s...")
                 time.sleep(10)
                 continue
 
@@ -102,60 +118,58 @@ def main():
                 webhook_signal=webhook_signal.get('direction') if webhook_signal else None
             )
 
-            logger.info(f"Score result: {result['score']}/6 - Fire: {result['fire']}")
+            # 3. SIGNAL FIRE & COOLDOWN LOGIC
+            if result['fire']:
+                direction = result['direction']
+                now = datetime.now()
+                
+                # Check if this direction is currently "locked" (Cooldown)
+                last_time = last_signal_time.get(direction)
+                if last_time and (now - last_time) < COOLDOWN_PERIOD:
+                    logger.info(f"SIGNAL SUPPRESSED: {direction} fired, but is currently in a 4-hour cooldown lock.")
+                else:
+                    logger.info(f"SIGNAL FIRED: {direction} with score {result['score']}")
+                    
+                    # Update the lock time
+                    last_signal_time[direction] = now
+                    
+                    # Format a mock trade_result for the Telegram alert
+                    mock_trade_result = {
+                        "success": True,
+                        "price": tick_data['ask'] if direction == "BUY" else tick_data['bid'],
+                        "sl": 0, "tp": 0, "lot_size": 0, "ticket": "SIGNAL_ONLY"
+                    }
+                    
+                    # Dynamic SL/TP calculation
+                    if atr:
+                        sl_multiplier, tp_multiplier = 1.5, 3.0
+                        if direction == "BUY":
+                            mock_trade_result['sl'] = round(mock_trade_result['price'] - (atr * sl_multiplier), 2)
+                            mock_trade_result['tp'] = round(mock_trade_result['price'] + (atr * tp_multiplier), 2)
+                        else:
+                            mock_trade_result['sl'] = round(mock_trade_result['price'] + (atr * sl_multiplier), 2)
+                            mock_trade_result['tp'] = round(mock_trade_result['price'] - (atr * tp_multiplier), 2)
+
+                    send_signal_alert(result, mock_trade_result)
+            else:
+                logger.info(f"No signal - Score: {result['score']}/6")
 
             # Log strategy signal for analysis
             log_strategy_signal(
-                symbol=config.SYMBOL,
-                timeframe=config.TIMEFRAME,
-                adx=adx if adx else 0,
-                atr=atr if atr else 0,
-                ema_fast=ema_fast if ema_fast else 0,
-                ema_slow=ema_slow if ema_slow else 0,
-                derivative_signal="N/A",
-                cot_bias=cot_data.get('bias') if cot_data else "NONE",
-                spread=tick_data.get('spread', 0),
+                symbol=config.SYMBOL, timeframe=config.TIMEFRAME,
+                adx=adx if adx else 0, atr=atr if atr else 0,
+                ema_fast=ema_fast if ema_fast else 0, ema_slow=ema_slow if ema_slow else 0,
+                derivative_signal="N/A", cot_bias=cot_data.get('bias') if cot_data else "NONE",
+                spread=tick_data.get('spread', 0), 
                 news_clear=not news_data.get('high_impact_soon', True) if news_data else True,
-                session_valid=True,
-                tv_signal=webhook_signal.get('direction') if webhook_signal else None,
-                total_score=result['score'],
-                fire_signal=result['fire']
+                session_valid=True, tv_signal=webhook_signal.get('direction') if webhook_signal else None,
+                total_score=result['score'], fire_signal=result['fire']
             )
 
-            # Send Telegram alert if score meets threshold
-            if result['fire']:
-                logger.info(f"SIGNAL FIRED: {result['direction']} with score {result['score']}")
-                
-                # Format a mock trade_result for the Telegram alert (since we aren't executing)
-                mock_trade_result = {
-                    "success": True,
-                    "price": tick_data['ask'] if result['direction'] == "BUY" else tick_data['bid'],
-                    "sl": 0, 
-                    "tp": 0,
-                    "lot_size": 0,
-                    "ticket": "SIGNAL_ONLY"
-                }
-                
-                # If we want real SL/TP in the message, we can calculate them here
-                if atr:
-                    # Modular SL/TP calculation
-                    sl_multiplier = 1.5
-                    tp_multiplier = 3.0
-                    if result['direction'] == "BUY":
-                        mock_trade_result['sl'] = round(mock_trade_result['price'] - (atr * sl_multiplier), 2)
-                        mock_trade_result['tp'] = round(mock_trade_result['price'] + (atr * tp_multiplier), 2)
-                    else:
-                        mock_trade_result['sl'] = round(mock_trade_result['price'] + (atr * sl_multiplier), 2)
-                        mock_trade_result['tp'] = round(mock_trade_result['price'] - (atr * tp_multiplier), 2)
-
-                send_signal_alert(result, mock_trade_result)
-            else:
-                logger.info("No signal meeting threshold.")
-
             # Wait before next cycle
-            logger.info("--- End of cycle ---")
+            logger.info(f"--- End of cycle (Waiting {SCAN_INTERVAL/60} mins) ---")
             cycle_count += 1
-            time.sleep(60)
+            time.sleep(SCAN_INTERVAL)
 
     except KeyboardInterrupt:
         logger.info("Received shutdown signal. Stopping bot...")
