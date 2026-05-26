@@ -17,7 +17,7 @@ from storage.db import init_database, log_strategy_signal, get_db_connection
 from strategy.indicators import calculate_adx, calculate_atr, calculate_ema
 from strategy.scorer import score, is_valid_session
 from signals.webhook_receiver import get_latest_signal
-from signals.telegram_notifier import send_signal_alert, send_status_update
+from signals.telegram_notifier import send_signal_alert, send_status_update, send_telegram_message
 
 # Configure logging
 logging.basicConfig(
@@ -44,11 +44,14 @@ def main():
     """Main signal generation loop"""
     # --- CONFIGURATION ---
     SCAN_INTERVAL = 300   # Scan every 5 minutes
-    HEARTBEAT_CYCLES = 12 # Heartbeat every hour
+    HEARTBEAT_CYCLES = 48 # Heartbeat every 4 hours (48 * 5 mins) during active sessions
     
     # SIGNAL LOCK: Prevents duplicate alerts for the same direction within 4 hours
     COOLDOWN_PERIOD = timedelta(hours=4)
     last_signal_time = {"BUY": None, "SELL": None}
+    
+    # Session state tracking
+    is_sleeping = False
     # ---------------------
 
     logger.info("Starting Gold Trader Signal Bot (Signal-Only Mode)")
@@ -70,26 +73,37 @@ def main():
         cycle_count = 0
         # Main loop
         while True:
-            # Heartbeat every hour
-            if cycle_count % HEARTBEAT_CYCLES == 0 and cycle_count > 0:
-                from signals.telegram_notifier import send_telegram_message
-                send_telegram_message("❤️ <b>Heartbeat:</b> Bot is still scanning Gold...")
-
             # 1. Market Open Check (Weekends)
             if not is_market_open():
+                if not is_sleeping:
+                    send_telegram_message("💤 <b>Weekend Mode:</b> Market is closed. Bot is sleeping until Sunday night.")
+                    is_sleeping = True
                 logger.info("Market is closed. Waiting...")
-                time.sleep(600)
+                time.sleep(3600) # Check once an hour on weekends
                 continue
 
             # 2. STRICT SESSION LOCK (Only trade London/NY)
             if not is_valid_session():
+                if not is_sleeping:
+                    send_telegram_message("🌙 <b>Session Lock:</b> Trading hours ended. Bot is entering power-save mode.")
+                    is_sleeping = True
                 logger.info("Outside valid trading sessions (London/NY). Scanning suspended.")
                 time.sleep(SCAN_INTERVAL)
                 continue
+            
+            # If we were sleeping and now session is valid
+            if is_sleeping:
+                send_telegram_message("🌅 <b>Waking Up:</b> Market session active. Starting Gold scan...")
+                is_sleeping = False
+                cycle_count = 0 # Reset cycle count for the new session
+
+            # 3. Heartbeat (Only during active sessions, every 4 hours)
+            if cycle_count > 0 and cycle_count % HEARTBEAT_CYCLES == 0:
+                send_telegram_message("❤️ <b>Heartbeat:</b> Bot is actively scanning Gold. All systems green.")
 
             logger.info("--- New scanning cycle ---")
 
-            # Get market data (Binance Live Feed)
+            # Get market data (Live Feed)
             tick_data = get_tick()
             bars_data = get_bars(count=100)
 
@@ -118,7 +132,7 @@ def main():
                 webhook_signal=webhook_signal.get('direction') if webhook_signal else None
             )
 
-            # 3. SIGNAL FIRE & COOLDOWN LOGIC
+            # 4. SIGNAL FIRE & COOLDOWN LOGIC
             if result['fire']:
                 direction = result['direction']
                 now = datetime.now()
@@ -166,9 +180,9 @@ def main():
                 total_score=result['score'], fire_signal=result['fire']
             )
 
-            # Wait before next cycle
-            logger.info(f"--- End of cycle (Waiting {SCAN_INTERVAL/60} mins) ---")
+            # Increment and wait
             cycle_count += 1
+            logger.info(f"--- End of cycle {cycle_count} (Waiting {SCAN_INTERVAL/60} mins) ---")
             time.sleep(SCAN_INTERVAL)
 
     except KeyboardInterrupt:
