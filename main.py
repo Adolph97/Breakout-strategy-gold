@@ -18,6 +18,7 @@ from strategy.indicators import calculate_adx, calculate_atr, calculate_ema
 from strategy.scorer import score
 from signals.webhook_receiver import get_latest_signal
 from execution.mt5_executor import execute_trade
+from signals.telegram_notifier import send_signal_alert
 
 # Configure logging
 logging.basicConfig(
@@ -151,6 +152,9 @@ def main():
                 # Execute the trade
                 atr_value = atr if atr else 0.5  # Fallback ATR value
                 trade_result = execute_trade(result['direction'], atr_value, range_width)
+
+                # Send Telegram notification
+                send_signal_alert(result, trade_result)
 
                 if trade_result['success']:
                     logger.info(f"Trade executed successfully: {trade_result}")
