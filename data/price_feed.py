@@ -3,32 +3,39 @@ import time
 import logging
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-# Using PAXG/USDT as a reliable proxy for Gold Spot (XAU/USD)
-# PAXG is a gold-backed token that tracks spot gold prices very closely.
-SYMBOL = "PAXGUSDT"
-BINANCE_URL = "https://api.binance.com/api/v3"
+# Using Kraken API as it is much more permissive for VPS/GCP regions than Binance.
+# We track PAXG/USD (Gold-backed token) as a precise proxy for spot Gold.
+KRAKEN_URL = "https://api.kraken.com/0/public"
 
 def get_tick():
     """
-    Fetch real-time price from Binance (PAXG/USDT)
+    Fetch real-time price from Kraken (PAXG/USD)
     Returns dict with bid, ask, spread
     """
     try:
-        # Get latest ticker price
-        url = f"{BINANCE_URL}/ticker/bookTicker?symbol={SYMBOL}"
-        response = requests.get(url, timeout=10)
+        # Get Ticker Info
+        url = f"{KRAKEN_URL}/Ticker?pair=PAXGUSD"
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
         
-        # Binance bookTicker gives us real-time bid/ask
-        bid = float(data['bidPrice'])
-        ask = float(data['askPrice'])
+        if data.get('error'):
+            logging.error(f"Kraken API Error: {data['error']}")
+            return _generate_simulated_tick()
+
+        # Kraken response structure for PAXGUSD
+        # The key name can vary (PAXGUSD, XPAXGZUSD, etc), so we grab the first result
+        pair_data = list(data['result'].values())[0]
         
-        # If the exchange spread is too tight (0.01), we add a small realistic spread for the bot
-        spread = ask - bid
+        # a = ask [price, whole lot volume, lot volume]
+        # b = bid [price, whole lot volume, lot volume]
+        ask = float(pair_data['a'][0])
+        bid = float(pair_data['b'][0])
+        
+        spread = round(ask - bid, 2)
         if spread < 0.10:
             spread = 0.35
             ask = bid + spread
@@ -36,64 +43,60 @@ def get_tick():
         result = {
             "bid": round(bid, 2),
             "ask": round(ask, 2),
-            "spread": round(spread, 2),
+            "spread": spread,
             "time": datetime.now()
         }
         return result
 
     except Exception as e:
-        logging.error(f"Error fetching tick data from Binance: {e}")
+        logging.error(f"Error fetching tick data from Kraken: {e}")
         return _generate_simulated_tick()
 
 def get_bars(count=100):
     """
-    Fetch historical OHLC bars from Binance
+    Fetch historical OHLC bars from Kraken (1 hour interval)
     Returns pandas DataFrame with OHLCV data
     """
     try:
-        # Get Klines (candlestick data)
-        # interval: 1h, limit: count
-        url = f"{BINANCE_URL}/klines?symbol={SYMBOL}&interval=1h&limit={count}"
-        response = requests.get(url, timeout=10)
+        # Get OHLC data (interval 60 = 1 hour)
+        url = f"{KRAKEN_URL}/OHLC?pair=PAXGUSD&interval=60"
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
         
-        # Binance kline format:
-        # [
-        #   [
-        #     1499040000000,      // Open time
-        #     "0.01634790",       // Open
-        #     "0.80000000",       // High
-        #     "0.01575800",       // Low
-        #     "0.01577100",       // Close
-        #     "148976.11427815",  // Volume
-        #     1499644799999,      // Close time
-        #     ...
-        #   ]
-        # ]
+        if data.get('error'):
+            logging.error(f"Kraken OHLC Error: {data['error']}")
+            return _generate_simulated_bars(count)
+
+        # Get the OHLC array from the result
+        pair_key = list(data['result'].keys())[0]
+        if pair_key == 'last': # Handle 'last' key if it's first
+            pair_key = list(data['result'].keys())[1]
+            
+        ohlc_data = data['result'][pair_key]
         
+        # Kraken OHLC format: [time, open, high, low, close, vwap, volume, count]
         bars = []
-        for item in data:
+        for item in ohlc_data[-count:]:
             bars.append({
-                'time': datetime.fromtimestamp(item[0] / 1000, tz=pytz.UTC),
+                'time': datetime.fromtimestamp(int(item[0]), tz=pytz.UTC),
                 'open': float(item[1]),
                 'high': float(item[2]),
                 'low': float(item[3]),
                 'close': float(item[4]),
-                'volume': float(item[5])
+                'volume': float(item[6])
             })
             
         df = pd.DataFrame(bars)
         return df
 
     except Exception as e:
-        logging.error(f"Error fetching bar data from Binance: {e}")
+        logging.error(f"Error fetching bar data from Kraken: {e}")
         return _generate_simulated_bars(count)
 
 def _generate_simulated_tick():
-    """Fallback simulation (last resort)"""
+    """Fallback simulation with fixed imports"""
     import random
-    # Use a more realistic 2026 base price if simulation is triggered
     base_price = 4505.0 
     change = random.uniform(-1.0, 1.0)
     new_price = base_price + change
@@ -106,9 +109,10 @@ def _generate_simulated_tick():
     }
 
 def _generate_simulated_bars(count):
-    """Fallback simulation (last resort)"""
+    """Fallback simulation with fixed imports"""
     import numpy as np
     end_time = datetime.now(pytz.UTC)
+    # Using timedelta from the top-level import
     start_time = end_time - timedelta(hours=count)
     timestamps = pd.date_range(start=start_time, end=end_time, periods=count, tz='UTC')
     base_price = 4505.0
@@ -125,7 +129,7 @@ def _generate_simulated_bars(count):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print(f"Testing Real-Time Price Feed via Binance ({SYMBOL})...")
+    print("Testing Real-Time Price Feed via Kraken (PAXGUSD)...")
     tick = get_tick()
     print(f"Current Tick: {tick}")
     
