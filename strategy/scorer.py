@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, time
+import pytz
 import sys
 import os
 
@@ -10,7 +11,7 @@ def is_valid_session():
         Boolean: True if in valid session
     """
     # Get current UTC time
-    utc_now = datetime.utcnow()
+    utc_now = datetime.now(pytz.UTC)
 
     # London session: 8:00 AM - 4:00 PM UTC (approximately)
     # New York session: 1:00 PM - 9:00 PM UTC (approximately)

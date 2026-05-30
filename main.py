@@ -135,7 +135,7 @@ def main():
             # 4. SIGNAL FIRE & COOLDOWN LOGIC
             if result['fire']:
                 direction = result['direction']
-                now = datetime.now()
+                now = datetime.now(pytz.UTC)
                 
                 # Check if this direction is currently "locked" (Cooldown)
                 last_time = last_signal_time.get(direction)
