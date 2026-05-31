@@ -2,8 +2,12 @@ import time
 import logging
 import sys
 import os
+import sqlite3
 from datetime import datetime, timedelta
 import pytz
+
+# Ensure logs directory exists before configuring logging
+os.makedirs('logs', exist_ok=True)
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +32,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
 
 def is_market_open():
@@ -113,8 +116,19 @@ def main():
                 continue
 
             # Get supplemental data
-            cot_data = get_latest_cot_from_db(db_conn)
-            news_data = get_latest_events_from_db(db_conn)
+            try:
+                cot_data = get_latest_cot_from_db(db_conn)
+                news_data = get_latest_events_from_db(db_conn)
+            except sqlite3.Error as e:
+                logging.warning(f"Database read error: {e}. Attempting reconnect...")
+                # Try to reconnect
+                try:
+                    db_conn.close()
+                except:
+                    pass
+                db_conn = get_db_connection()
+                cot_data = get_latest_cot_from_db(db_conn)
+                news_data = get_latest_events_from_db(db_conn)
             webhook_signal = get_latest_signal()
 
             # Calculate indicators
@@ -168,17 +182,21 @@ def main():
             else:
                 logger.info(f"No signal - Score: {result['score']}/6")
 
-            # Log strategy signal for analysis
-            log_strategy_signal(
-                symbol=config.SYMBOL, timeframe=config.TIMEFRAME,
-                adx=adx if adx else 0, atr=atr if atr else 0,
-                ema_fast=ema_fast if ema_fast else 0, ema_slow=ema_slow if ema_slow else 0,
-                derivative_signal="N/A", cot_bias=cot_data.get('bias') if cot_data else "NONE",
-                spread=tick_data.get('spread', 0), 
-                news_clear=not news_data.get('high_impact_soon', True) if news_data else True,
-                session_valid=True, tv_signal=webhook_signal.get('direction') if webhook_signal else None,
-                total_score=result['score'], fire_signal=result['fire']
-            )
+            # Log strategy signal for analysis (with error handling)
+            try:
+                log_strategy_signal(
+                    symbol=config.SYMBOL, timeframe=config.TIMEFRAME,
+                    adx=adx if adx else 0, atr=atr if atr else 0,
+                    ema_fast=ema_fast if ema_fast else 0, ema_slow=ema_slow if ema_slow else 0,
+                    derivative_signal="N/A", cot_bias=cot_data.get('bias') if cot_data else "NONE",
+                    spread=tick_data.get('spread', 0),
+                    news_clear=not news_data.get('high_impact_soon', True) if news_data else True,
+                    session_valid=is_valid_session(), tv_signal=webhook_signal.get('direction') if webhook_signal else None,
+                    total_score=result['score'], fire_signal=result['fire']
+                )
+            except sqlite3.Error as e:
+                logging.warning(f"Database write error during log_strategy_signal: {e}")
+                # Continue running - don't let DB write failure crash the loop
 
             # Increment and wait
             cycle_count += 1
@@ -197,5 +215,4 @@ def main():
             db_conn.close()
 
 if __name__ == "__main__":
-    os.makedirs('logs', exist_ok=True)
     main()
