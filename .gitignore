@@ -12,9 +12,13 @@ __pycache__/
 # Mac
 .DS_Store
 
-# Logs and DB
+# Logs
 logs/
-storage/
+
+# DB - ignore database files but allow code
+storage/*.db
+storage/*.sqlite
+storage/*.sqlite3
 
 # Docs (already added)
 *.md
