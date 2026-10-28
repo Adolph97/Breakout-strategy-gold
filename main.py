@@ -14,14 +14,29 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import all modules
 import config
-from data.price_feed import get_tick, get_bars
+from data.price_feed import get_tick, get_bars, get_multi_timeframe_context
 from data.cot_feed import get_latest_cot_from_db
 from data.calendar_feed import get_latest_events_from_db
-from storage.db import init_database, log_strategy_signal, get_db_connection
-from strategy.indicators import calculate_adx, calculate_atr, calculate_ema
-from strategy.scorer import score, is_valid_session
-from signals.webhook_receiver import get_latest_signal
-from signals.telegram_notifier import send_signal_alert, send_status_update, send_telegram_message
+from storage.db import (
+    init_database,
+    log_strategy_signal,
+    get_db_connection,
+    check_weekly_governor,
+    log_sentinel_trade
+)
+from strategy.scorer import score, is_valid_session, get_session_name
+try:
+    from signals.webhook_receiver import get_latest_signal
+except ImportError:
+    def get_latest_signal():
+        return None
+from signals.telegram_notifier import (
+    send_signal_alert,
+    send_trade_card,
+    send_status_update,
+    send_telegram_message,
+    send_heartbeat_status
+)
 
 # Configure logging
 logging.basicConfig(
@@ -34,36 +49,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 def is_market_open():
     """
-    Check if forex market is open (simplified - XAUUSD trades 24/5)
-    Returns True if Monday-Friday, not Saturday-Sunday
+    Check if forex market is open and not in Friday flattening.
+    Friday >= 20:00 UTC triggers 100% cash mode through Sunday night.
+    Returns:
+        tuple (is_open: bool, is_friday_flatten: bool)
     """
     now = datetime.now(pytz.UTC)
     weekday = now.weekday()  # Monday=0, Sunday=6
-    return weekday < 5  # Monday-Friday
+    hour = now.hour
+
+    if weekday == 4 and hour >= 20:  # Friday 20:00+ UTC
+        return False, True
+    if weekday in [5, 6]:  # Saturday & Sunday
+        return False, False
+    return True, False
+
 
 def main():
-    """Main signal generation loop"""
+    """Main signal generation loop running the 8-Gate Institutional Sentinel"""
     # --- CONFIGURATION ---
     SCAN_INTERVAL = 300   # Scan every 5 minutes
     HEARTBEAT_CYCLES = 48 # Heartbeat every 4 hours (48 * 5 mins) during active sessions
     
-    # SIGNAL LOCK: Prevents duplicate alerts for the same direction within 4 hours
-    COOLDOWN_PERIOD = timedelta(hours=4)
-    last_signal_time = {"BUY": None, "SELL": None}
-    
     # Session state tracking
     is_sleeping = False
+    flattened_this_weekend = False
     # ---------------------
 
-    logger.info("Starting Gold Trader Signal Bot (Signal-Only Mode)")
+    logger.info("Starting Gold Institutional Sentinel Bot (8-Gate Confluence Engine)")
     
     # Send Startup Notification
     send_status_update("STARTUP")
     
-    logger.info(f"Configuration: Symbol={config.SYMBOL}, Timeframe={config.TIMEFRAME}")
-    logger.info(f"Minimum score required for Telegram alert: {config.MIN_SCORE}/6")
+    logger.info(f"Configuration: Symbol={getattr(config, 'SYMBOL', 'XAUUSD')}")
+    logger.info(f"Target: ≥ 500 Pips ($50.00) Asymmetric Runner | TP1: +150 Pips ($15.00) -> BE Lock")
     logger.info(f"Scan Interval: {SCAN_INTERVAL} seconds")
 
     # Initialize database
@@ -72,135 +94,131 @@ def main():
     try:
         # Get a persistent database connection for the main loop
         db_conn = get_db_connection()
-        
         cycle_count = 0
-        # Main loop
+
         while True:
-            # 1. Market Open Check (Weekends)
-            if not is_market_open():
-                if not is_sleeping:
+            # 1. Market Open & Weekend Risk Flattening Check
+            market_open, is_friday_flatten = is_market_open()
+
+            if not market_open:
+                if is_friday_flatten and not flattened_this_weekend:
+                    logger.info("Friday 20:00 UTC reached. Flattening all open risk.")
+                    send_status_update("WEEKEND_FLATTEN")
+                    flattened_this_weekend = True
+                    is_sleeping = True
+
+                elif not is_sleeping:
                     send_telegram_message("💤 <b>Weekend Mode:</b> Market is closed. Bot is sleeping until Sunday night.")
                     is_sleeping = True
-                logger.info("Market is closed. Waiting...")
-                time.sleep(3600) # Check once an hour on weekends
+
+                logger.info("Market is closed. Sleeping 1 hour...")
+                time.sleep(3600)
                 continue
 
-            # 2. STRICT SESSION LOCK (Only trade London/NY)
+            # Reset weekend flag when week reopens
+            flattened_this_weekend = False
+
+            # 2. STRICT SESSION LOCK (London 07-10 UTC & NY 13-15 UTC)
             if not is_valid_session():
                 if not is_sleeping:
-                    send_telegram_message("🌙 <b>Session Lock:</b> Trading hours ended. Bot is entering power-save mode.")
+                    session_name = get_session_name()
+                    send_telegram_message(
+                        f"🌙 <b>Session Lock:</b> Current window is {session_name}. "
+                        f"Scanning suspended until London (07:00 UTC) or NY (13:00 UTC)."
+                    )
                     is_sleeping = True
-                logger.info("Outside valid trading sessions (London/NY). Scanning suspended.")
+                logger.info(f"Outside high-liquidity session windows ({get_session_name()}). Waiting...")
                 time.sleep(SCAN_INTERVAL)
                 continue
             
-            # If we were sleeping and now session is valid
+            # Waking up for active session
             if is_sleeping:
-                send_telegram_message("🌅 <b>Waking Up:</b> Market session active. Starting Gold scan...")
+                send_telegram_message(f"🌅 <b>Session Active:</b> {get_session_name()} window open. Evaluating 8-Gate Confluence...")
                 is_sleeping = False
-                cycle_count = 0 # Reset cycle count for the new session
+                cycle_count = 0
 
-            # 3. Heartbeat (Only during active sessions, every 4 hours)
-            if cycle_count > 0 and cycle_count % HEARTBEAT_CYCLES == 0:
-                send_telegram_message("❤️ <b>Heartbeat:</b> Bot is actively scanning Gold. All systems green.")
+            logger.info("--- New 8-Gate scanning cycle ---")
 
-            logger.info("--- New scanning cycle ---")
-
-            # Get market data (Live Feed)
+            # 3. Fetch Live Market Data & Multi-Timeframe Context
             tick_data = get_tick()
-            bars_data = get_bars(count=100)
-
-            if not tick_data or bars_data is None:
-                logger.warning("Failed to get market data. Retrying in 10s...")
+            try:
+                context = get_multi_timeframe_context()
+            except Exception as e:
+                logger.error(f"Failed to fetch multi-timeframe context: {e}")
                 time.sleep(10)
                 continue
 
-            # Get supplemental data
-            try:
-                cot_data = get_latest_cot_from_db(db_conn)
-                news_data = get_latest_events_from_db(db_conn)
-            except sqlite3.Error as e:
-                logging.warning(f"Database read error: {e}. Attempting reconnect...")
-                # Try to reconnect
-                try:
-                    db_conn.close()
-                except:
-                    pass
-                db_conn = get_db_connection()
-                cot_data = get_latest_cot_from_db(db_conn)
-                news_data = get_latest_events_from_db(db_conn)
-            webhook_signal = get_latest_signal()
+            if not tick_data or context is None:
+                logger.warning("Failed to obtain market feed. Retrying in 10s...")
+                time.sleep(10)
+                continue
 
-            # Calculate indicators
-            adx = calculate_adx(bars_data)
-            atr = calculate_atr(bars_data)
-            ema_fast = calculate_ema(bars_data, period=9)
-            ema_slow = calculate_ema(bars_data, period=21)
+            # 4. Evaluate 8-Gate Confluence Engine
+            result = score(tick_data=tick_data, context=context)
 
-            # Calculate score
-            result = score(
-                tick_data=tick_data,
-                bars_df=bars_data,
-                cot_data=cot_data,
-                news_data=news_data,
-                webhook_signal=webhook_signal.get('direction') if webhook_signal else None
-            )
+            # 5. Heartbeat (Every 4 hours during active sessions)
+            if cycle_count > 0 and cycle_count % HEARTBEAT_CYCLES == 0:
+                send_heartbeat_status(result)
 
-            # 4. SIGNAL FIRE & COOLDOWN LOGIC
+            # 6. SIGNAL FIRE & ASYMMETRIC EXECUTION
             if result['fire']:
                 direction = result['direction']
-                now = datetime.now(pytz.UTC)
-                
-                # Check if this direction is currently "locked" (Cooldown)
-                last_time = last_signal_time.get(direction)
-                if last_time and (now - last_time) < COOLDOWN_PERIOD:
-                    logger.info(f"SIGNAL SUPPRESSED: {direction} fired, but is currently in a 4-hour cooldown lock.")
-                else:
-                    logger.info(f"SIGNAL FIRED: {direction} with score {result['score']}")
-                    
-                    # Update the lock time
-                    last_signal_time[direction] = now
-                    
-                    # Format a mock trade_result for the Telegram alert
-                    mock_trade_result = {
-                        "success": True,
-                        "price": tick_data['ask'] if direction == "BUY" else tick_data['bid'],
-                        "sl": 0, "tp": 0, "lot_size": 0, "ticket": "SIGNAL_ONLY"
-                    }
-                    
-                    # Dynamic SL/TP calculation
-                    if atr:
-                        sl_multiplier, tp_multiplier = 1.5, 3.0
-                        if direction == "BUY":
-                            mock_trade_result['sl'] = round(mock_trade_result['price'] - (atr * sl_multiplier), 2)
-                            mock_trade_result['tp'] = round(mock_trade_result['price'] + (atr * tp_multiplier), 2)
-                        else:
-                            mock_trade_result['sl'] = round(mock_trade_result['price'] + (atr * sl_multiplier), 2)
-                            mock_trade_result['tp'] = round(mock_trade_result['price'] - (atr * tp_multiplier), 2)
+                logger.info(f"*** HIGH-CONVICTION SIGNAL FIRED: {direction} ***")
+                logger.info(f"Setup: {result['setup']} | Score: {result['score']}/8")
+                logger.info(f"Entry: ${result['entry_price']:.2f} | SL: ${result['sl_price']:.2f}")
+                logger.info(f"Stage 1 TP (+150 pips): ${result['tp_stage1']:.2f}")
+                logger.info(f"Stage 2 TP (+500 pips): ${result['tp_stage2']:.2f}")
+                logger.info(f"Lots: Order A={result['lot_order_a']} | Order B={result['lot_order_b']}")
 
-                    send_signal_alert(result, mock_trade_result)
+                # Broadcast complete Trade Card to Telegram
+                send_trade_card(result)
+
+                # Record trade to SQLite (Enforces weekly governor quota)
+                try:
+                    gates_summary = ", ".join([f"{k}:{v}" for k, v in result['gates'].items()])
+                    log_sentinel_trade(
+                        direction=direction,
+                        price=result['entry_price'],
+                        lot_size=result['total_lots'],
+                        sl=result['sl_price'],
+                        tp_stage1=result['tp_stage1'],
+                        tp_stage2=result['tp_stage2'],
+                        setup=result['setup'],
+                        gates_summary=gates_summary
+                    )
+                    logger.info("Trade successfully logged to SQLite trades_log.")
+                except Exception as e:
+                    logger.error(f"Error logging trade to database: {e}")
+
             else:
-                logger.info(f"No signal - Score: {result['score']}/6")
+                logger.info(f"Status: STAND BY — Score: {result['score']}/8 gates passed.")
+                for k, v in result['gates'].items():
+                    logger.info(f"  {k}: {v}")
 
-            # Log strategy signal for analysis (with error handling)
+            # 7. Telemetry Logging to SQLite
             try:
                 log_strategy_signal(
-                    symbol=config.SYMBOL, timeframe=config.TIMEFRAME,
-                    adx=adx if adx else 0, atr=atr if atr else 0,
-                    ema_fast=ema_fast if ema_fast else 0, ema_slow=ema_slow if ema_slow else 0,
-                    derivative_signal="N/A", cot_bias=cot_data.get('bias') if cot_data else "NONE",
-                    spread=tick_data.get('spread', 0),
-                    news_clear=not news_data.get('high_impact_soon', True) if news_data else True,
-                    session_valid=is_valid_session(), tv_signal=webhook_signal.get('direction') if webhook_signal else None,
-                    total_score=result['score'], fire_signal=result['fire']
+                    symbol=getattr(config, 'SYMBOL', 'XAUUSD'),
+                    timeframe="H1",
+                    adx=0.0,
+                    atr=result.get('d1_atr', 0.0),
+                    ema_fast=context.get('h4_ema50', 0.0),
+                    ema_slow=context.get('d1_ema200', 0.0),
+                    derivative_signal=result.get('setup', 'N/A'),
+                    cot_bias="N/A",
+                    spread=tick_data.get('spread', 0.0),
+                    news_clear=True,
+                    session_valid=is_valid_session(),
+                    tv_signal=None,
+                    total_score=result['score'],
+                    fire_signal=result['fire']
                 )
             except sqlite3.Error as e:
-                logging.warning(f"Database write error during log_strategy_signal: {e}")
-                # Continue running - don't let DB write failure crash the loop
+                logger.warning(f"Database write error during telemetry logging: {e}")
 
             # Increment and wait
             cycle_count += 1
-            logger.info(f"--- End of cycle {cycle_count} (Waiting {SCAN_INTERVAL/60} mins) ---")
+            logger.info(f"--- End of cycle {cycle_count} (Waiting {SCAN_INTERVAL/60:.1f} mins) ---")
             time.sleep(SCAN_INTERVAL)
 
     except KeyboardInterrupt:
@@ -211,8 +229,12 @@ def main():
         logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
         send_status_update("ERROR", error_details)
     finally:
-        if 'db_conn' in locals():
-            db_conn.close()
+        if 'db_conn' in locals() and db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     main()

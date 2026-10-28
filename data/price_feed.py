@@ -10,6 +10,12 @@ import pytz
 # We track PAXG/USD (Gold-backed token) as a precise proxy for spot Gold.
 KRAKEN_URL = "https://api.kraken.com/0/public"
 
+# In-memory DXY cache to prevent rate-limiting
+_dxy_cache = {
+    "timestamp": 0,
+    "data": {"dxy_close": 102.5, "dxy_bearish": False, "dxy_bullish": False}
+}
+
 def get_tick():
     """
     Fetch real-time price from Kraken (PAXG/USD)
@@ -93,6 +99,133 @@ def get_bars(count=100):
     except Exception as e:
         logging.error(f"Error fetching bar data from Kraken: {e}")
         return _generate_simulated_bars(count)
+
+def get_kraken_ohlc_dataframe(interval, count=300):
+    """
+    Fetch OHLC DataFrame from Kraken for a given interval (60=1h, 240=4h, 1440=1d)
+    """
+    try:
+        url = f"{KRAKEN_URL}/OHLC?pair=PAXGUSD&interval={interval}"
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('error'):
+            logging.error(f"Kraken OHLC Error: {data['error']}")
+            return None
+        pair_key = [k for k in data['result'].keys() if k != 'last'][0]
+        ohlc_data = data['result'][pair_key][-count:]
+        df = pd.DataFrame(ohlc_data, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        df['time'] = pd.to_datetime(df['time'].astype(int), unit='s', utc=True)
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching Kraken OHLC (interval={interval}): {e}")
+        return None
+
+def fetch_dxy_signals():
+    """
+    Fetches daily US Dollar Index (DXY) momentum signals (cached for 1 hour).
+    Returns dict: {'dxy_close': float, 'dxy_bearish': bool, 'dxy_bullish': bool}
+    """
+    global _dxy_cache
+    now = time.time()
+    if now - _dxy_cache["timestamp"] < 3600 and _dxy_cache["data"]:
+        return _dxy_cache["data"]
+
+    try:
+        import yfinance as yf
+        dxy = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False)
+        if isinstance(dxy.columns, pd.MultiIndex):
+            dxy.columns = [c[0] for c in dxy.columns]
+        dxy = dxy.reset_index()
+        dxy['ema20'] = dxy['Close'].ewm(span=20, adjust=False).mean()
+        dxy['ret5'] = dxy['Close'].pct_change(5)
+        # Shift 1 day to strictly avoid lookahead bias
+        prior = dxy.iloc[-2]
+        is_bearish = bool((prior['Close'] < prior['ema20']) and (prior['ret5'] < 0))
+        is_bullish = bool((prior['Close'] > prior['ema20']) and (prior['ret5'] > 0))
+        res = {
+            "dxy_close": float(prior['Close']),
+            "dxy_bearish": is_bearish,
+            "dxy_bullish": is_bullish
+        }
+        _dxy_cache["timestamp"] = now
+        _dxy_cache["data"] = res
+        return res
+    except Exception as e:
+        logging.warning(f"Failed to fetch DXY: {e}. Using cached value.")
+        return _dxy_cache["data"]
+
+def get_multi_timeframe_context():
+    """
+    Fetches and computes complete multi-timeframe and intermarket context:
+    - 1H: Bars, Monday IB range (mon_high, mon_low), volume ratio, candle conviction
+    - 4H: H4 EMA50, EMA200, 32-hour Donchian high (h4_h8) & low (h4_l8)
+    - D1: Daily EMA50, EMA200, ATR(14)
+    - DXY: Intermarket trend signals
+    """
+    h1 = get_kraken_ohlc_dataframe(interval=60, count=300)
+    h4 = get_kraken_ohlc_dataframe(interval=240, count=300)
+    d1 = get_kraken_ohlc_dataframe(interval=1440, count=300)
+
+    if h1 is None or h4 is None or d1 is None:
+        # Fallback simulation
+        h1 = _generate_simulated_bars(100)
+        return {
+            "h1": h1, "latest_bar": h1.iloc[-1], "d1_atr14": 30.0, "d1_ema50": 4000.0, "d1_ema200": 3900.0,
+            "h4_ema50": 4020.0, "h4_ema200": 3950.0, "h4_h8": 4050.0, "h4_l8": 3980.0,
+            "mon_high": 4040.0, "mon_low": 3990.0, "vol_ratio": 1.0, "close_pct": 0.5,
+            "dxy_bearish": False, "dxy_bullish": False, "dxy_close": 102.5
+        }
+
+    # Daily features (shifted 1 day)
+    d1['ema50'] = d1['close'].ewm(span=50, adjust=False).mean()
+    d1['ema200'] = d1['close'].ewm(span=200, adjust=False).mean()
+    d1['atr14'] = (d1['high'] - d1['low']).rolling(14).mean()
+    d1_prior = d1.iloc[-2]
+
+    # 4-Hour features (shifted 1 bar)
+    h4['ema50'] = h4['close'].ewm(span=50, adjust=False).mean()
+    h4['ema200'] = h4['close'].ewm(span=200, adjust=False).mean()
+    h4['h8'] = h4['high'].rolling(8).max()
+    h4['l8'] = h4['low'].rolling(8).min()
+    h4_prior = h4.iloc[-2]
+
+    # 1H features & Monday IB
+    h1['dow'] = h1['time'].dt.day_of_week
+    now_utc = datetime.now(pytz.UTC)
+    monday_bars = h1[(h1['dow'] == 0) & ((now_utc - h1['time']).dt.total_seconds() < 7 * 86400)]
+    mon_high = float(monday_bars['high'].max()) if len(monday_bars) > 0 else 0.0
+    mon_low = float(monday_bars['low'].min()) if len(monday_bars) > 0 else 0.0
+
+    vol_ma20 = h1['volume'].rolling(20).mean().iloc[-1]
+    latest_bar = h1.iloc[-1]
+    vol_ratio = float(latest_bar['volume'] / max(vol_ma20, 0.001))
+    c_rng = max(float(latest_bar['high'] - latest_bar['low']), 0.01)
+    close_pct = float((latest_bar['close'] - latest_bar['low']) / c_rng)
+
+    dxy = fetch_dxy_signals()
+
+    return {
+        "h1": h1,
+        "latest_bar": latest_bar,
+        "d1_atr14": float(d1_prior['atr14']),
+        "d1_ema50": float(d1_prior['ema50']),
+        "d1_ema200": float(d1_prior['ema200']),
+        "h4_ema50": float(h4_prior['ema50']),
+        "h4_ema200": float(h4_prior['ema200']),
+        "h4_h8": float(h4_prior['h8']),
+        "h4_l8": float(h4_prior['l8']),
+        "mon_high": mon_high,
+        "mon_low": mon_low,
+        "vol_ratio": vol_ratio,
+        "close_pct": close_pct,
+        "dxy_bearish": dxy.get("dxy_bearish", False),
+        "dxy_bullish": dxy.get("dxy_bullish", False),
+        "dxy_close": dxy.get("dxy_close", 102.5)
+    }
+
 
 def _generate_simulated_tick():
     """Fallback simulation with fixed imports"""
