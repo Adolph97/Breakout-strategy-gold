@@ -1,6 +1,6 @@
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 # Database file path
@@ -195,6 +195,52 @@ def log_strategy_signal(symbol, timeframe, adx, atr, ema_fast, ema_slow,
         tv_signal,
         total_score,
         fire_signal
+    ))
+    conn.commit()
+    conn.close()
+
+def check_weekly_governor(week_start_iso=None):
+    """
+    Check if a trade has already executed during the current calendar week.
+    Enforces the Weekly Governor (max 1 trade per week).
+    Returns True if eligible to trade (0 trades executed), False if quota filled.
+    """
+    if week_start_iso is None:
+        now = datetime.now()
+        # Monday of current week
+        monday = now - timedelta(days=now.weekday())
+        week_start_iso = monday.strftime('%Y-%m-%d')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*) FROM trades_log
+        WHERE timestamp >= ?
+    ''', (week_start_iso,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count == 0
+
+def log_sentinel_trade(direction, price, lot_size, sl, tp_stage1, tp_stage2, setup, gates_summary):
+    """
+    Log an 8-Gate Institutional Sentinel trade to trades_log
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO trades_log
+        (timestamp, direction, price, lot_size, sl, tp, score, reasons, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        datetime.now().isoformat(),
+        direction,
+        price,
+        lot_size,
+        sl,
+        tp_stage2,  # Full runner target
+        8,          # All 8 gates passed
+        f"{setup} | TP1: {tp_stage1} | TP2: {tp_stage2} | {gates_summary}",
+        'open'
     ))
     conn.commit()
     conn.close()
