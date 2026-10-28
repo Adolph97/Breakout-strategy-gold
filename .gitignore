@@ -23,3 +23,8 @@ storage/*.sqlite3
 # Docs (already added)
 *.md
 !README.md
+!SYSTEM_EXPORT_AND_RUNBOOK.md
+
+# Reference research export (local only)
+trader/
+
