@@ -165,19 +165,14 @@ def get_multi_timeframe_context():
     - D1: Daily EMA50, EMA200, ATR(14)
     - DXY: Intermarket trend signals
     """
-    h1 = get_kraken_ohlc_dataframe(interval=60, count=300)
-    h4 = get_kraken_ohlc_dataframe(interval=240, count=300)
-    d1 = get_kraken_ohlc_dataframe(interval=1440, count=300)
+    # Kraken returns at most 720 bars; take all so the EMA200s are properly warmed up.
+    h1 = get_kraken_ohlc_dataframe(interval=60, count=720)
+    h4 = get_kraken_ohlc_dataframe(interval=240, count=720)
+    d1 = get_kraken_ohlc_dataframe(interval=1440, count=720)
 
     if h1 is None or h4 is None or d1 is None:
-        # Fallback simulation
-        h1 = _generate_simulated_bars(100)
-        return {
-            "h1": h1, "latest_bar": h1.iloc[-1], "d1_atr14": 30.0, "d1_ema50": 4000.0, "d1_ema200": 3900.0,
-            "h4_ema50": 4020.0, "h4_ema200": 3950.0, "h4_h8": 4050.0, "h4_l8": 3980.0,
-            "mon_high": 4040.0, "mon_low": 3990.0, "vol_ratio": 1.0, "close_pct": 0.5,
-            "dxy_bearish": False, "dxy_bullish": False, "dxy_close": 102.5
-        }
+        # Fail safe: never score a signal on simulated prices — the caller skips the cycle.
+        return None
 
     # Daily features (shifted 1 day)
     d1['ema50'] = d1['close'].ewm(span=50, adjust=False).mean()
@@ -188,8 +183,9 @@ def get_multi_timeframe_context():
     # 4-Hour features (shifted 1 bar)
     h4['ema50'] = h4['close'].ewm(span=50, adjust=False).mean()
     h4['ema200'] = h4['close'].ewm(span=200, adjust=False).mean()
-    h4['h8'] = h4['high'].rolling(8).max()
-    h4['l8'] = h4['low'].rolling(8).min()
+    # Donchian over the 8 H4 bars BEFORE the last completed one (matches trader/features.py)
+    h4['h8'] = h4['high'].rolling(8).max().shift(1)
+    h4['l8'] = h4['low'].rolling(8).min().shift(1)
     h4_prior = h4.iloc[-2]
 
     # 1H features & Monday IB
@@ -199,8 +195,9 @@ def get_multi_timeframe_context():
     mon_high = float(monday_bars['high'].max()) if len(monday_bars) > 0 else 0.0
     mon_low = float(monday_bars['low'].min()) if len(monday_bars) > 0 else 0.0
 
-    vol_ma20 = h1['volume'].rolling(20).mean().iloc[-1]
-    latest_bar = h1.iloc[-1]
+    # Score the last CLOSED H1 bar (Kraken's final bar is still forming), as in the backtest
+    latest_bar = h1.iloc[-2]
+    vol_ma20 = h1['volume'].rolling(20).mean().shift(1).iloc[-2]
     vol_ratio = float(latest_bar['volume'] / max(vol_ma20, 0.001))
     c_rng = max(float(latest_bar['high'] - latest_bar['low']), 0.01)
     close_pct = float((latest_bar['close'] - latest_bar['low']) / c_rng)
