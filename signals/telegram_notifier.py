@@ -53,7 +53,7 @@ def send_status_update(status_type, details=None):
         message = (
             f"{emoji} <b>Gold Institutional Sentinel Bot Started</b>\n"
             f"<b>Strategy:</b> 8-Gate Confluence (84.2% Win Rate / 4.58 PF)\n"
-            f"<b>Target:</b> ≥ 500 Pips ($50.00) Asymmetric Runner\n"
+            f"<b>Target:</b> Runner at 1.8x D1 ATR (TP1 at 0.55x ATR)\n"
             f"<b>Governor:</b> Max 1 High-Conviction Trade/Week\n"
             f"<b>Time:</b> {now_str} UTC"
         )
@@ -80,7 +80,7 @@ def send_status_update(status_type, details=None):
 def send_trade_card(res: dict) -> bool:
     """
     Broadcasts the complete 8-Gate Institutional Sentinel Trade Card to Telegram.
-    Enforces 2-stage execution (+150 pips TP1 -> BE, +500 pips TP2 runner).
+    Enforces 2-stage execution (TP1 at 0.55x D1 ATR -> BE, runner at 1.8x D1 ATR).
     """
     action = res.get("action", "ACTIONABLE")
     direction = res.get("direction", "BUY")
@@ -90,7 +90,7 @@ def send_trade_card(res: dict) -> bool:
     sl_pips = res.get("sl_pips", 0.0)
     tp1 = res.get("tp_stage1", 0.0)
     tp2 = res.get("tp_stage2", 0.0)
-    rr = 500.0 / sl_pips if sl_pips > 0 else 0.0
+    rr = abs(tp2 - entry) / abs(entry - sl) if sl and entry != sl else 0.0
 
     account = res.get("account_size", 50000.0)
     risk_pct = res.get("risk_pct", 1.0)
@@ -110,9 +110,9 @@ def send_trade_card(res: dict) -> bool:
         f"<b>Risk / Reward:</b> 1 : {rr:.2f} (Runner Target)",
         "",
         f"🎯 <b>2-STAGE ASYMMETRIC EXECUTION</b>",
-        f"• <b>Stage 1 (+150 pips / +$15.00):</b> ${tp1:,.2f}",
+        f"• <b>Stage 1 (+{abs(tp1 - entry):.2f}):</b> ${tp1:,.2f}",
         f"  ↳ <i>Bank 50% volume & lock SL to Breakeven</i>",
-        f"• <b>Stage 2 (+500 pips / +$50.00):</b> ${tp2:,.2f}",
+        f"• <b>Stage 2 (+{abs(tp2 - entry):.2f}):</b> ${tp2:,.2f}",
         f"  ↳ <i>50% Runner target</i>",
         "",
         f"⚖️ <b>POSITION SIZING (${account:,.0f} @ {risk_pct:.1f}% Risk = ${risk_dollars:,.2f})</b>",

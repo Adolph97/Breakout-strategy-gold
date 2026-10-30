@@ -85,7 +85,7 @@ def main():
     send_status_update("STARTUP")
     
     logger.info(f"Configuration: Symbol={getattr(config, 'SYMBOL', 'XAUUSD')}")
-    logger.info(f"Target: ≥ 500 Pips ($50.00) Asymmetric Runner | TP1: +150 Pips ($15.00) -> BE Lock")
+    logger.info("Targets scale with D1 ATR: TP1 0.55x ATR -> BE lock | Runner 1.8x ATR")
     logger.info(f"Scan Interval: {SCAN_INTERVAL} seconds")
 
     # Initialize database
@@ -119,7 +119,8 @@ def main():
             flattened_this_weekend = False
 
             # 2. STRICT SESSION LOCK (London 07-10 UTC & NY 13-15 UTC)
-            if not is_valid_session():
+            # Signals come from the last CLOSED H1 bar, so scan while that bar's hour is a session hour
+            if not is_valid_session(datetime.now(pytz.UTC) - timedelta(hours=1)):
                 if not is_sleeping:
                     session_name = get_session_name()
                     send_telegram_message(
@@ -166,8 +167,8 @@ def main():
                 logger.info(f"*** HIGH-CONVICTION SIGNAL FIRED: {direction} ***")
                 logger.info(f"Setup: {result['setup']} | Score: {result['score']}/8")
                 logger.info(f"Entry: ${result['entry_price']:.2f} | SL: ${result['sl_price']:.2f}")
-                logger.info(f"Stage 1 TP (+150 pips): ${result['tp_stage1']:.2f}")
-                logger.info(f"Stage 2 TP (+500 pips): ${result['tp_stage2']:.2f}")
+                logger.info(f"Stage 1 TP: ${result['tp_stage1']:.2f}")
+                logger.info(f"Stage 2 TP: ${result['tp_stage2']:.2f}")
                 logger.info(f"Lots: Order A={result['lot_order_a']} | Order B={result['lot_order_b']}")
 
                 # Broadcast complete Trade Card to Telegram
