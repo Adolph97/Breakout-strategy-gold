@@ -18,8 +18,11 @@ services:
     ports:
       - "5000:5000"    # TradingView webhook
     volumes:
-      - trader_db:/app/storage
+      # Mounted beside the code, not over /app/storage: a volume there would keep serving the
+      # OLD storage/db.py after every rebuild. The existing gold_trader.db in this volume is kept.
+      - trader_db:/app/db_data
     environment:
+      GOLD_DB_PATH: /app/db_data/gold_trader.db
       MT5_HOST: mt5   # Docker service name resolves to container IP
       MT5_PORT: 8001
       # Your trading bot configuration (can also be set in config.py)

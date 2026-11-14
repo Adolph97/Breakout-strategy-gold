@@ -1,10 +1,11 @@
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 # Database file path
-DB_PATH = os.path.join(os.path.dirname(__file__), 'gold_trader.db')
+# Override with GOLD_DB_PATH so the database can live on a volume separate from the code
+DB_PATH = os.environ.get('GOLD_DB_PATH') or os.path.join(os.path.dirname(__file__), 'gold_trader.db')
 
 def get_db_connection():
     """
@@ -137,6 +138,27 @@ def init_database():
         )
     ''')
 
+    # Paper (forward-test) trades — never counted by the live weekly governor
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            setup TEXT,
+            direction TEXT,
+            signal_time TEXT UNIQUE,
+            entry_time TEXT,
+            week_key TEXT,
+            entry_price REAL,
+            sl_price REAL,
+            tp_price REAL,
+            d1_atr REAL,
+            swept_level REAL,
+            status TEXT DEFAULT 'open',
+            exit_time TEXT,
+            exit_price REAL,
+            r_multiple REAL
+        )
+    ''')
+
     conn.commit()
     conn.close()
     logging.info("Database initialized successfully")
@@ -206,8 +228,8 @@ def check_weekly_governor(week_start_iso=None):
     Returns True if eligible to trade (0 trades executed), False if quota filled.
     """
     if week_start_iso is None:
-        now = datetime.now()
-        # Monday of current week
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # Monday of current week (UTC, matching the timestamps written by log_sentinel_trade)
         monday = now - timedelta(days=now.weekday())
         week_start_iso = monday.strftime('%Y-%m-%d')
     
@@ -232,7 +254,7 @@ def log_sentinel_trade(direction, price, lot_size, sl, tp_stage1, tp_stage2, set
         (timestamp, direction, price, lot_size, sl, tp, score, reasons, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        datetime.now().isoformat(),
+        datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         direction,
         price,
         lot_size,
@@ -244,6 +266,68 @@ def log_sentinel_trade(direction, price, lot_size, sl, tp_stage1, tp_stage2, set
     ))
     conn.commit()
     conn.close()
+
+def log_paper_trade(trade: dict) -> bool:
+    """Insert a paper trade. Returns False if this signal bar was already logged."""
+    conn = get_db_connection()
+    try:
+        cur = conn.execute('''
+            INSERT OR IGNORE INTO paper_trades
+            (setup, direction, signal_time, entry_time, week_key, entry_price, sl_price, tp_price, d1_atr, swept_level)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (trade["setup"], trade["direction"], trade["signal_time"], trade["entry_time"], trade["week_key"],
+              trade["entry_price"], trade["sl_price"], trade["tp_price"], trade["d1_atr"], trade["swept_level"]))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def paper_trades_in_week(week_key: str) -> int:
+    conn = get_db_connection()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM paper_trades WHERE week_key = ?", (week_key,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_open_paper_trades() -> list:
+    conn = get_db_connection()
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def close_paper_trade(trade_id: int, status: str, exit_time: str, exit_price: float, r_multiple: float):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "UPDATE paper_trades SET status = ?, exit_time = ?, exit_price = ?, r_multiple = ? WHERE id = ?",
+            (status, exit_time, exit_price, r_multiple, trade_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def paper_stats() -> dict:
+    """Running forward-test scorecard for closed paper trades."""
+    conn = get_db_connection()
+    try:
+        rs = [r[0] for r in conn.execute(
+            "SELECT r_multiple FROM paper_trades WHERE status != 'open' AND r_multiple IS NOT NULL ORDER BY id")]
+        n_open = conn.execute("SELECT COUNT(*) FROM paper_trades WHERE status = 'open'").fetchone()[0]
+    finally:
+        conn.close()
+    n = len(rs)
+    return {
+        "closed": n,
+        "open": n_open,
+        "wins": sum(1 for r in rs if r > 0),
+        "total_r": round(sum(rs), 2),
+        "avg_r": round(sum(rs) / n, 3) if n else 0.0,
+    }
+
 
 def get_latest_cot():
     """

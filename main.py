@@ -22,8 +22,14 @@ from storage.db import (
     log_strategy_signal,
     get_db_connection,
     check_weekly_governor,
-    log_sentinel_trade
+    log_sentinel_trade,
+    log_paper_trade,
+    paper_trades_in_week,
+    get_open_paper_trades,
+    close_paper_trade,
+    paper_stats
 )
+from strategy import sweep_reject
 from strategy.scorer import score, is_valid_session, get_session_name
 try:
     from signals.webhook_receiver import get_latest_signal
@@ -35,7 +41,9 @@ from signals.telegram_notifier import (
     send_trade_card,
     send_status_update,
     send_telegram_message,
-    send_heartbeat_status
+    send_heartbeat_status,
+    send_paper_signal,
+    send_paper_result
 )
 
 # Configure logging
@@ -68,36 +76,154 @@ def is_market_open():
     return True, False
 
 
+def in_scan_window(utc_dt=None) -> bool:
+    """
+    True while the last CLOSED H1 bar's hour is one a strategy can signal on:
+    07-16 UTC for the paper Sweep & Reject test (a superset of the 8-gate
+    London 07-09 / New York 13-15 hours). The 8-gate scorer applies its own session gate.
+    """
+    utc_dt = utc_dt or datetime.now(pytz.UTC)
+    bar_hour = (utc_dt - timedelta(hours=1)).hour
+    return sweep_reject.HOUR_START <= bar_hour <= sweep_reject.HOUR_END
+
+
+def resolve_paper_trades(feat):
+    """Closes any paper trade whose stop, target or Friday exit has been reached."""
+    for trade in get_open_paper_trades():
+        try:
+            outcome = sweep_reject.resolve(trade, feat)
+            if outcome is None:
+                continue
+            status, exit_time, exit_price, r = outcome
+            close_paper_trade(trade["id"], status, exit_time, exit_price, round(r, 3))
+            logger.info(f"PAPER trade #{trade['id']} closed: {status} at {exit_price:.2f} ({r:+.2f}R)")
+            send_paper_result(trade, status, exit_price, r, paper_stats())
+        except Exception as e:
+            logger.error(f"Error resolving paper trade #{trade.get('id')}: {e}")
+
+
+def process_paper_setup(context, tick_data):
+    """Evaluates the paper-only Sweep & Reject setup on the newly closed bar."""
+    bar = context["latest_bar"]
+    direction = sweep_reject.detect(bar)
+    if direction is None:
+        return None
+
+    entry_time = bar["time"] + timedelta(hours=1)
+    if paper_trades_in_week(sweep_reject.week_key(entry_time)) >= sweep_reject.MAX_PER_WEEK:
+        logger.info(f"PAPER {direction} setup on {bar['time']} skipped: weekly cap reached.")
+        return None
+
+    # Backtest entry = next bar's open (+/- half the spread). Use that bar's open if the feed
+    # already has it, otherwise the live quote.
+    feat, idx = context["features"], context["bar_index"]
+    half_spread = tick_data.get("spread", 0.5) / 2.0
+    if idx + 1 < len(feat):
+        mid_ref = float(feat["open"].iloc[idx + 1]) + half_spread   # bars are bid-side
+        entry = mid_ref + half_spread if direction == "BUY" else mid_ref - half_spread
+    else:
+        entry = tick_data["ask"] if direction == "BUY" else tick_data["bid"]
+
+    trade = sweep_reject.build_trade(bar, direction, entry)
+    if log_paper_trade(trade):
+        logger.info(f"PAPER SIGNAL {direction}: entry {trade['entry_price']} "
+                    f"SL {trade['sl_price']} TP {trade['tp_price']}")
+        send_paper_signal(trade, paper_stats())
+        return trade
+    return None
+
+
+def process_closed_bar(context, tick_data, heartbeat=False):
+    """Scores one newly closed H1 bar with the 8-gate engine and the paper setup."""
+    result = score(tick_data=tick_data, context=context)
+
+    if heartbeat:
+        send_heartbeat_status(result)
+
+    if result['fire']:
+        direction = result['direction']
+        logger.info(f"*** 8-GATE SIGNAL FIRED: {direction} ***")
+        logger.info(f"Setup: {result['setup']} | Score: {result['score']}/8")
+        logger.info(f"Entry: ${result['entry_price']:.2f} | SL: ${result['sl_price']:.2f}")
+        logger.info(f"Stage 1 TP: ${result['tp_stage1']:.2f}")
+        logger.info(f"Stage 2 TP: ${result['tp_stage2']:.2f}")
+        logger.info(f"Lots: Order A={result['lot_order_a']} | Order B={result['lot_order_b']}")
+
+        send_trade_card(result)
+
+        # Record trade to SQLite (enforces weekly governor quota)
+        try:
+            gates_summary = ", ".join([f"{k}:{v}" for k, v in result['gates'].items()])
+            log_sentinel_trade(
+                direction=direction,
+                price=result['entry_price'],
+                lot_size=result['total_lots'],
+                sl=result['sl_price'],
+                tp_stage1=result['tp_stage1'],
+                tp_stage2=result['tp_stage2'],
+                setup=result['setup'],
+                gates_summary=gates_summary
+            )
+            logger.info("Trade successfully logged to SQLite trades_log.")
+        except Exception as e:
+            logger.error(f"Error logging trade to database: {e}")
+    else:
+        logger.info(f"8-gate: STAND BY — Score: {result['score']}/8 gates passed.")
+        for k, v in result['gates'].items():
+            logger.info(f"  {k}: {v}")
+
+    try:
+        process_paper_setup(context, tick_data)
+    except Exception as e:
+        logger.error(f"Error processing paper setup: {e}")
+
+    # Telemetry
+    try:
+        log_strategy_signal(
+            symbol=getattr(config, 'SYMBOL', 'XAUUSD'),
+            timeframe="H1",
+            adx=0.0,
+            atr=result.get('d1_atr', 0.0),
+            ema_fast=context.get('h4_ema50', 0.0),
+            ema_slow=context.get('d1_ema200', 0.0),
+            derivative_signal=result.get('setup', 'N/A'),
+            cot_bias="N/A",
+            spread=tick_data.get('spread', 0.0),
+            news_clear=True,
+            session_valid=is_valid_session(context["latest_bar"]["time"]),
+            tv_signal=None,
+            total_score=result['score'],
+            fire_signal=result['fire']
+        )
+    except sqlite3.Error as e:
+        logger.warning(f"Database write error during telemetry logging: {e}")
+    return result
+
+
 def main():
-    """Main signal generation loop running the 8-Gate Institutional Sentinel"""
-    # --- CONFIGURATION ---
-    SCAN_INTERVAL = 300   # Scan every 5 minutes
-    HEARTBEAT_CYCLES = 48 # Heartbeat every 4 hours (48 * 5 mins) during active sessions
-    
-    # Session state tracking
+    """Main loop: 8-Gate Sentinel + paper-only Sweep & Reject forward test, on spot XAU/USD."""
+    SCAN_INTERVAL = 300    # Check for a newly closed H1 bar every 5 minutes
+    HEARTBEAT_BARS = 4     # Heartbeat every 4th scored bar (~4 hours of active scanning)
+    OFF_SESSION_RESOLVE_EVERY = 12  # While idle, still settle open paper trades hourly
+
     is_sleeping = False
     flattened_this_weekend = False
-    # ---------------------
+    last_bar_time = None
+    idle_cycles = 0
+    bars_scored = 0
 
-    logger.info("Starting Gold Institutional Sentinel Bot (8-Gate Confluence Engine)")
-    
-    # Send Startup Notification
+    logger.info("Starting Gold Sentinel Bot (8-Gate engine + paper Sweep & Reject test)")
     send_status_update("STARTUP")
-    
-    logger.info(f"Configuration: Symbol={getattr(config, 'SYMBOL', 'XAUUSD')}")
-    logger.info("Targets scale with D1 ATR: TP1 0.55x ATR -> BE lock | Runner 1.8x ATR")
+    logger.info(f"Configuration: Symbol={getattr(config, 'SYMBOL', 'XAUUSD')} | Feed: spot XAU/USD H1 (Dukascopy)")
     logger.info(f"Scan Interval: {SCAN_INTERVAL} seconds")
 
-    # Initialize database
     init_database()
 
     try:
-        # Get a persistent database connection for the main loop
-        db_conn = get_db_connection()
         cycle_count = 0
 
         while True:
-            # 1. Market Open & Weekend Risk Flattening Check
+            # 1. Market open & weekend flattening
             market_open, is_friday_flatten = is_market_open()
 
             if not market_open:
@@ -106,6 +232,15 @@ def main():
                     send_status_update("WEEKEND_FLATTEN")
                     flattened_this_weekend = True
                     is_sleeping = True
+                    # Settle paper trades at the Friday 20:00 bar once it has closed
+                    time.sleep(3660)
+                    try:
+                        ctx = get_multi_timeframe_context()
+                        if ctx:
+                            resolve_paper_trades(ctx["features"])
+                    except Exception as e:
+                        logger.error(f"Weekend paper settlement failed: {e}")
+                    continue
 
                 elif not is_sleeping:
                     send_telegram_message("💤 <b>Weekend Mode:</b> Market is closed. Bot is sleeping until Sunday night.")
@@ -115,111 +250,67 @@ def main():
                 time.sleep(3600)
                 continue
 
-            # Reset weekend flag when week reopens
             flattened_this_weekend = False
 
-            # 2. STRICT SESSION LOCK (London 07-10 UTC & NY 13-15 UTC)
-            # Signals come from the last CLOSED H1 bar, so scan while that bar's hour is a session hour
-            if not is_valid_session(datetime.now(pytz.UTC) - timedelta(hours=1)):
+            # 2. Scan window (last closed bar's hour 07-16 UTC)
+            if not in_scan_window():
                 if not is_sleeping:
-                    session_name = get_session_name()
                     send_telegram_message(
-                        f"🌙 <b>Session Lock:</b> Current window is {session_name}. "
-                        f"Scanning suspended until London (07:00 UTC) or NY (13:00 UTC)."
+                        "🌙 <b>Scan window closed.</b> Signals are evaluated on H1 bars closing "
+                        "08:00–17:00 UTC (Mon–Fri)."
                     )
                     is_sleeping = True
-                logger.info(f"Outside high-liquidity session windows ({get_session_name()}). Waiting...")
+                idle_cycles += 1
+                if idle_cycles % OFF_SESSION_RESOLVE_EVERY == 0 and get_open_paper_trades():
+                    try:
+                        ctx = get_multi_timeframe_context()
+                        if ctx:
+                            resolve_paper_trades(ctx["features"])
+                    except Exception as e:
+                        logger.error(f"Off-session paper settlement failed: {e}")
                 time.sleep(SCAN_INTERVAL)
                 continue
-            
-            # Waking up for active session
+
             if is_sleeping:
-                send_telegram_message(f"🌅 <b>Session Active:</b> {get_session_name()} window open. Evaluating 8-Gate Confluence...")
+                send_telegram_message("🌅 <b>Scan window open.</b> Evaluating each closed H1 bar (spot XAU/USD).")
                 is_sleeping = False
                 cycle_count = 0
+                idle_cycles = 0
 
-            logger.info("--- New 8-Gate scanning cycle ---")
-
-            # 3. Fetch Live Market Data & Multi-Timeframe Context
-            tick_data = get_tick()
+            # 3. Market data
             try:
                 context = get_multi_timeframe_context()
             except Exception as e:
                 logger.error(f"Failed to fetch multi-timeframe context: {e}")
-                time.sleep(10)
+                time.sleep(30)
                 continue
 
-            if not tick_data or context is None:
-                logger.warning("Failed to obtain market feed. Retrying in 10s...")
-                time.sleep(10)
+            if context is None:
+                logger.warning("Spot feed unavailable or stale. Retrying in 60s...")
+                time.sleep(60)
                 continue
 
-            # 4. Evaluate 8-Gate Confluence Engine
-            result = score(tick_data=tick_data, context=context)
+            resolve_paper_trades(context["features"])
 
-            # 5. Heartbeat (Every 4 hours during active sessions)
-            if cycle_count > 0 and cycle_count % HEARTBEAT_CYCLES == 0:
-                send_heartbeat_status(result)
+            # 4. Score each closed bar exactly once (as the backtest does)
+            bar_time = context["latest_bar"]["time"]
+            if last_bar_time is not None and bar_time <= last_bar_time:
+                cycle_count += 1
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-            # 6. SIGNAL FIRE & ASYMMETRIC EXECUTION
-            if result['fire']:
-                direction = result['direction']
-                logger.info(f"*** HIGH-CONVICTION SIGNAL FIRED: {direction} ***")
-                logger.info(f"Setup: {result['setup']} | Score: {result['score']}/8")
-                logger.info(f"Entry: ${result['entry_price']:.2f} | SL: ${result['sl_price']:.2f}")
-                logger.info(f"Stage 1 TP: ${result['tp_stage1']:.2f}")
-                logger.info(f"Stage 2 TP: ${result['tp_stage2']:.2f}")
-                logger.info(f"Lots: Order A={result['lot_order_a']} | Order B={result['lot_order_b']}")
+            tick_data = get_tick()
+            if not tick_data:
+                logger.warning("Failed to obtain spot quote. Retrying in 30s...")
+                time.sleep(30)
+                continue
 
-                # Broadcast complete Trade Card to Telegram
-                send_trade_card(result)
+            logger.info(f"--- New closed H1 bar {bar_time} | close {float(context['latest_bar']['close']):.2f} ---")
+            bars_scored += 1
+            process_closed_bar(context, tick_data, heartbeat=(bars_scored % HEARTBEAT_BARS == 0))
+            last_bar_time = bar_time
 
-                # Record trade to SQLite (Enforces weekly governor quota)
-                try:
-                    gates_summary = ", ".join([f"{k}:{v}" for k, v in result['gates'].items()])
-                    log_sentinel_trade(
-                        direction=direction,
-                        price=result['entry_price'],
-                        lot_size=result['total_lots'],
-                        sl=result['sl_price'],
-                        tp_stage1=result['tp_stage1'],
-                        tp_stage2=result['tp_stage2'],
-                        setup=result['setup'],
-                        gates_summary=gates_summary
-                    )
-                    logger.info("Trade successfully logged to SQLite trades_log.")
-                except Exception as e:
-                    logger.error(f"Error logging trade to database: {e}")
-
-            else:
-                logger.info(f"Status: STAND BY — Score: {result['score']}/8 gates passed.")
-                for k, v in result['gates'].items():
-                    logger.info(f"  {k}: {v}")
-
-            # 7. Telemetry Logging to SQLite
-            try:
-                log_strategy_signal(
-                    symbol=getattr(config, 'SYMBOL', 'XAUUSD'),
-                    timeframe="H1",
-                    adx=0.0,
-                    atr=result.get('d1_atr', 0.0),
-                    ema_fast=context.get('h4_ema50', 0.0),
-                    ema_slow=context.get('d1_ema200', 0.0),
-                    derivative_signal=result.get('setup', 'N/A'),
-                    cot_bias="N/A",
-                    spread=tick_data.get('spread', 0.0),
-                    news_clear=True,
-                    session_valid=is_valid_session(),
-                    tv_signal=None,
-                    total_score=result['score'],
-                    fire_signal=result['fire']
-                )
-            except sqlite3.Error as e:
-                logger.warning(f"Database write error during telemetry logging: {e}")
-
-            # Increment and wait
             cycle_count += 1
-            logger.info(f"--- End of cycle {cycle_count} (Waiting {SCAN_INTERVAL/60:.1f} mins) ---")
             time.sleep(SCAN_INTERVAL)
 
     except KeyboardInterrupt:
@@ -229,12 +320,6 @@ def main():
         error_details = str(e)
         logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
         send_status_update("ERROR", error_details)
-    finally:
-        if 'db_conn' in locals() and db_conn:
-            try:
-                db_conn.close()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":

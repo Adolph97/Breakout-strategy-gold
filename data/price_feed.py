@@ -1,269 +1,272 @@
-import os
+"""
+data/price_feed.py
+------------------
+Live market data for the Gold Sentinel.
+
+The feed is spot XAU/USD hourly bars from Dukascopy — the SAME source the strategy
+was backtested on — and every feature is derived from those H1 bars exactly the way
+trader/features.py derives them. Live and backtest therefore evaluate identical numbers.
+
+(The previous feed was Kraken PAXG/USD. PAXG trades 24/7 with unrelated volume, so the
+volume gate, the Monday range and the daily EMAs/ATR all differed from the backtest.)
+
+There is no simulated fallback: if the feed fails or is stale, callers get None and
+must skip the cycle. A signal is never scored on made-up prices.
+"""
+
 import time
 import logging
-import requests
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import pytz
 
-# Using Kraken API as it is much more permissive for VPS/GCP regions than Binance.
-# We track PAXG/USD (Gold-backed token) as a precise proxy for spot Gold.
-KRAKEN_URL = "https://api.kraken.com/0/public"
+logger = logging.getLogger(__name__)
 
-# In-memory DXY cache to prevent rate-limiting
-_dxy_cache = {
-    "timestamp": 0,
-    "data": {"dxy_close": 102.5, "dxy_bearish": False, "dxy_bullish": False}
-}
+# ~3 years of H1 bars: enough for the D1 EMA200 to be fully converged
+# (the weight of the seed value after 750+ daily bars is < 0.1%).
+LOOKBACK_DAYS = 1100
+# The last closed H1 bar must be at most this old, or the feed is treated as stale.
+MAX_BAR_AGE_HOURS = 3.0
+
+_dxy_cache = {"timestamp": 0.0, "frame": None}
+
+
+# ── Raw data ──────────────────────────────────────────────────────────────────
+
+def _fetch_dukascopy(start, end, side="bid"):
+    import dukascopy_python as dk
+    from dukascopy_python.instruments import INSTRUMENT_FX_METALS_XAU_USD
+
+    logging.getLogger("DUKASCRIPT").setLevel(logging.WARNING)
+    offer = dk.OFFER_SIDE_BID if side == "bid" else dk.OFFER_SIDE_ASK
+    df = dk.fetch(INSTRUMENT_FX_METALS_XAU_USD, dk.INTERVAL_HOUR_1, offer, start, end)
+    if df is None or len(df) == 0:
+        return None
+    df = df.reset_index().rename(columns={"timestamp": "time"})
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df[["time", "open", "high", "low", "close", "volume"]].astype(
+        {c: float for c in ["open", "high", "low", "close", "volume"]}
+    )
+    # Drop market-closed filler bars, as the backtest data does
+    df = df[(df["volume"] > 0) & (df["high"] > df["low"])]
+    return df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+
+def get_spot_h1(lookback_days=LOOKBACK_DAYS, now=None):
+    """Spot XAU/USD H1 bars (bid side, UTC, bar time = bar open). None on failure."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        return _fetch_dukascopy(now - timedelta(days=lookback_days), now + timedelta(hours=1))
+    except Exception as e:
+        logger.error(f"Dukascopy H1 fetch failed: {e}")
+        return None
+
 
 def get_tick():
     """
-    Fetch real-time price from Kraken (PAXG/USD)
-    Returns dict with bid, ask, spread
+    Current spot bid/ask, taken from the forming H1 bar on each side of the book.
+    Returns None on failure (never a simulated price).
     """
+    now = datetime.now(timezone.utc)
     try:
-        # Get Ticker Info
-        url = f"{KRAKEN_URL}/Ticker?pair=PAXGUSD"
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('error'):
-            logging.error(f"Kraken API Error: {data['error']}")
-            return _generate_simulated_tick()
-
-        # Kraken response structure for PAXGUSD
-        # The key name can vary (PAXGUSD, XPAXGZUSD, etc), so we grab the first result
-        pair_data = list(data['result'].values())[0]
-        
-        # a = ask [price, whole lot volume, lot volume]
-        # b = bid [price, whole lot volume, lot volume]
-        ask = float(pair_data['a'][0])
-        bid = float(pair_data['b'][0])
-        
-        spread = round(ask - bid, 2)
-        if spread < 0.10:
-            spread = 0.35
-            ask = bid + spread
-
-        result = {
+        bid_df = _fetch_dukascopy(now - timedelta(days=4), now + timedelta(hours=1), "bid")
+        ask_df = _fetch_dukascopy(now - timedelta(days=4), now + timedelta(hours=1), "ask")
+        if bid_df is None or ask_df is None:
+            return None
+        bid = float(bid_df["close"].iloc[-1])
+        ask = float(ask_df["close"].iloc[-1])
+        if ask <= bid:
+            ask = bid + 0.50
+        return {
             "bid": round(bid, 2),
             "ask": round(ask, 2),
-            "spread": spread,
-            "time": datetime.now()
+            "spread": round(ask - bid, 2),
+            "time": bid_df["time"].iloc[-1].to_pydatetime(),
         }
-        return result
-
     except Exception as e:
-        logging.error(f"Error fetching tick data from Kraken: {e}")
-        return _generate_simulated_tick()
-
-def get_bars(count=100):
-    """
-    Fetch historical OHLC bars from Kraken (1 hour interval)
-    Returns pandas DataFrame with OHLCV data
-    """
-    try:
-        # Get OHLC data (interval 60 = 1 hour)
-        url = f"{KRAKEN_URL}/OHLC?pair=PAXGUSD&interval=60"
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('error'):
-            logging.error(f"Kraken OHLC Error: {data['error']}")
-            return _generate_simulated_bars(count)
-
-        # Get the OHLC array from the result
-        pair_key = list(data['result'].keys())[0]
-        if pair_key == 'last': # Handle 'last' key if it's first
-            pair_key = list(data['result'].keys())[1]
-            
-        ohlc_data = data['result'][pair_key]
-        
-        # Kraken OHLC format: [time, open, high, low, close, vwap, volume, count]
-        bars = []
-        for item in ohlc_data[-count:]:
-            bars.append({
-                'time': datetime.fromtimestamp(int(item[0]), tz=pytz.UTC),
-                'open': float(item[1]),
-                'high': float(item[2]),
-                'low': float(item[3]),
-                'close': float(item[4]),
-                'volume': float(item[6])
-            })
-            
-        df = pd.DataFrame(bars)
-        return df
-
-    except Exception as e:
-        logging.error(f"Error fetching bar data from Kraken: {e}")
-        return _generate_simulated_bars(count)
-
-def get_kraken_ohlc_dataframe(interval, count=300):
-    """
-    Fetch OHLC DataFrame from Kraken for a given interval (60=1h, 240=4h, 1440=1d)
-    """
-    try:
-        url = f"{KRAKEN_URL}/OHLC?pair=PAXGUSD&interval={interval}"
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('error'):
-            logging.error(f"Kraken OHLC Error: {data['error']}")
-            return None
-        pair_key = [k for k in data['result'].keys() if k != 'last'][0]
-        ohlc_data = data['result'][pair_key][-count:]
-        df = pd.DataFrame(ohlc_data, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
-        df['time'] = pd.to_datetime(df['time'].astype(int), unit='s', utc=True)
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-        return df
-    except Exception as e:
-        logging.error(f"Error fetching Kraken OHLC (interval={interval}): {e}")
+        logger.error(f"Error fetching spot tick: {e}")
         return None
 
-def fetch_dxy_signals():
-    """
-    Fetches daily US Dollar Index (DXY) momentum signals (cached for 1 hour).
-    Returns dict: {'dxy_close': float, 'dxy_bearish': bool, 'dxy_bullish': bool}
-    """
-    global _dxy_cache
-    now = time.time()
-    if now - _dxy_cache["timestamp"] < 3600 and _dxy_cache["data"]:
-        return _dxy_cache["data"]
 
+def get_bars(count=100):
+    """Last `count` spot H1 bars (kept for backwards compatibility). Empty frame on failure."""
+    h1 = get_spot_h1(lookback_days=max(10, int(count / 16) + 7))
+    return h1.tail(count).reset_index(drop=True) if h1 is not None else pd.DataFrame()
+
+
+def fetch_dxy_daily():
+    """Daily DXY closes (cached for 1 hour). Returns DataFrame[date, Close] or None."""
+    now = time.time()
+    if _dxy_cache["frame"] is not None and now - _dxy_cache["timestamp"] < 3600:
+        return _dxy_cache["frame"]
     try:
         import yfinance as yf
-        dxy = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False)
+        dxy = yf.download("DX-Y.NYB", period="1y", interval="1d", progress=False)
         if isinstance(dxy.columns, pd.MultiIndex):
             dxy.columns = [c[0] for c in dxy.columns]
         dxy = dxy.reset_index()
-        dxy['ema20'] = dxy['Close'].ewm(span=20, adjust=False).mean()
-        dxy['ret5'] = dxy['Close'].pct_change(5)
-        # Shift 1 day to strictly avoid lookahead bias
-        prior = dxy.iloc[-2]
-        is_bearish = bool((prior['Close'] < prior['ema20']) and (prior['ret5'] < 0))
-        is_bullish = bool((prior['Close'] > prior['ema20']) and (prior['ret5'] > 0))
-        res = {
-            "dxy_close": float(prior['Close']),
-            "dxy_bearish": is_bearish,
-            "dxy_bullish": is_bullish
-        }
+        dxy["date"] = pd.to_datetime(dxy["Date"]).dt.date
+        dxy = dxy[["date", "Close"]].dropna().reset_index(drop=True)
+        if len(dxy) < 30:
+            raise ValueError(f"only {len(dxy)} DXY rows")
         _dxy_cache["timestamp"] = now
-        _dxy_cache["data"] = res
-        return res
+        _dxy_cache["frame"] = dxy
+        return dxy
     except Exception as e:
-        logging.warning(f"Failed to fetch DXY: {e}. Using cached value.")
-        return _dxy_cache["data"]
+        logger.warning(f"Failed to fetch DXY: {e}. Using last cached frame (if any).")
+        return _dxy_cache["frame"]
 
-def get_multi_timeframe_context():
-    """
-    Fetches and computes complete multi-timeframe and intermarket context:
-    - 1H: Bars, Monday IB range (mon_high, mon_low), volume ratio, candle conviction
-    - 4H: H4 EMA50, EMA200, 32-hour Donchian high (h4_h8) & low (h4_l8)
-    - D1: Daily EMA50, EMA200, ATR(14)
-    - DXY: Intermarket trend signals
-    """
-    # Kraken returns at most 720 bars; take all so the EMA200s are properly warmed up.
-    h1 = get_kraken_ohlc_dataframe(interval=60, count=720)
-    h4 = get_kraken_ohlc_dataframe(interval=240, count=720)
-    d1 = get_kraken_ohlc_dataframe(interval=1440, count=720)
 
-    if h1 is None or h4 is None or d1 is None:
-        # Fail safe: never score a signal on simulated prices — the caller skips the cycle.
+# ── Features (mirror of trader/features.py) ───────────────────────────────────
+
+def dxy_signals(dxy):
+    """
+    Per-date DXY flags. As in trader/features.py: the row for date D carries the
+    values of the previous DXY trading day, so a bar never sees its own day's close.
+    """
+    d = dxy.copy()
+    d["ema20"] = d["Close"].ewm(span=20, adjust=False).mean()
+    d["ret5"] = d["Close"].pct_change(5)
+    d["dxy_bearish"] = (d["Close"] < d["ema20"]) & (d["ret5"] < 0)
+    d["dxy_bullish"] = (d["Close"] > d["ema20"]) & (d["ret5"] > 0)
+    out = d[["Close", "dxy_bearish", "dxy_bullish"]].shift(1)
+    out["date"] = d["date"].values
+    # Early in the UTC day the DXY feed may not have a row for "today" yet. The previous
+    # trading day's values are then simply the last row, so add them for the next 4 dates
+    # (covers a weekend) to keep live identical to the backtest.
+    last = d.iloc[-1]
+    extra = pd.DataFrame({
+        "Close": last["Close"], "dxy_bearish": last["dxy_bearish"], "dxy_bullish": last["dxy_bullish"],
+        "date": [last["date"] + timedelta(days=k) for k in range(1, 5)],
+    })
+    out = pd.concat([out, extra], ignore_index=True)
+    return out.rename(columns={"Close": "dxy_close"})
+
+
+def build_features(h1, dxy=None):
+    """
+    Computes, for every H1 bar, the features the strategies use. All higher-timeframe
+    values are shifted so a bar only sees completed days / completed H4 bars.
+    """
+    df = h1.sort_values("time").reset_index(drop=True).copy()
+    df["date"] = df["time"].dt.date
+    df["dow"] = df["time"].dt.dayofweek
+    df["hour"] = df["time"].dt.hour
+    iso = df["time"].dt.isocalendar()
+    df["week_key"] = iso.year.astype(str) + "_" + iso.week.astype(str)
+
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+
+    # Daily context: yesterday's completed day
+    d1 = df.set_index("time").resample("1D").agg(agg).dropna()
+    d1["d1_ema50"] = d1["close"].ewm(span=50, adjust=False).mean()
+    d1["d1_ema200"] = d1["close"].ewm(span=200, adjust=False).mean()
+    d1["d1_atr14"] = (d1["high"] - d1["low"]).rolling(14).mean()
+    d1["prev_day_high"] = d1["high"]
+    d1["prev_day_low"] = d1["low"]
+    d1s = d1[["d1_ema50", "d1_ema200", "d1_atr14", "prev_day_high", "prev_day_low"]].shift(1).reset_index()
+    d1s["date"] = d1s["time"].dt.date
+    df = df.merge(d1s.drop(columns="time"), on="date", how="left")
+
+    # H4 context: last completed H4 bar
+    h4 = df.set_index("time").resample("4h").agg(agg).dropna()
+    h4["h4_ema50"] = h4["close"].ewm(span=50, adjust=False).mean()
+    h4["h4_ema200"] = h4["close"].ewm(span=200, adjust=False).mean()
+    h4["h4_h8"] = h4["high"].rolling(8).max().shift(1)
+    h4["h4_l8"] = h4["low"].rolling(8).min().shift(1)
+    h4s = h4[["h4_ema50", "h4_ema200", "h4_h8", "h4_l8"]].shift(1).reset_index()
+    df = pd.merge_asof(df.sort_values("time"), h4s.sort_values("time"), on="time", direction="backward")
+
+    # Monday range of the bar's ISO week
+    mon = df[df["dow"] == 0].groupby("week_key").agg(mon_high=("high", "max"), mon_low=("low", "min")).reset_index()
+    df = df.merge(mon, on="week_key", how="left")
+
+    # H1 microstructure
+    df["vol_ma20"] = df["volume"].rolling(20).mean().shift(1)
+    df["vol_ratio"] = df["volume"] / df["vol_ma20"]
+    rng = np.maximum(df["high"] - df["low"], 0.01)
+    df["close_pct"] = (df["close"] - df["low"]) / rng
+
+    if dxy is not None and len(dxy):
+        df = df.merge(dxy_signals(dxy), on="date", how="left")
+    else:
+        df["dxy_close"] = np.nan
+        df["dxy_bearish"] = False
+        df["dxy_bullish"] = False
+    return df.sort_values("time").reset_index(drop=True)
+
+
+def last_closed_index(feat, now=None):
+    """Index of the last fully closed H1 bar (a bar opened at T closes at T+1h)."""
+    now = pd.Timestamp(now or datetime.now(timezone.utc))
+    closed = feat.index[feat["time"] + pd.Timedelta(hours=1) <= now]
+    return int(closed[-1]) if len(closed) else None
+
+
+def context_from_features(feat, idx):
+    """Builds the scorer's context dict for the bar at `idx`."""
+    row = feat.iloc[idx]
+
+    def f(key):
+        v = row.get(key)
+        return float(v) if pd.notna(v) else 0.0
+
+    return {
+        "feed": "dukascopy_xauusd",
+        "features": feat,
+        "bar_index": idx,
+        "latest_bar": row,
+        "d1_atr14": f("d1_atr14"),
+        "d1_ema50": f("d1_ema50"),
+        "d1_ema200": f("d1_ema200"),
+        "h4_ema50": f("h4_ema50"),
+        "h4_ema200": f("h4_ema200"),
+        "h4_h8": f("h4_h8"),
+        "h4_l8": f("h4_l8"),
+        "mon_high": f("mon_high"),
+        "mon_low": f("mon_low"),
+        "prev_day_high": f("prev_day_high"),
+        "prev_day_low": f("prev_day_low"),
+        "vol_ratio": f("vol_ratio"),
+        "close_pct": float(row["close_pct"]),
+        "dxy_bearish": bool(row.get("dxy_bearish") is True or row.get("dxy_bearish") == True),
+        "dxy_bullish": bool(row.get("dxy_bullish") is True or row.get("dxy_bullish") == True),
+        "dxy_close": f("dxy_close"),
+    }
+
+
+def get_multi_timeframe_context(now=None):
+    """
+    Fetches spot H1 bars + DXY and returns the context for the last CLOSED H1 bar.
+    Returns None if the feed failed or the last closed bar is stale.
+    """
+    now = now or datetime.now(timezone.utc)
+    h1 = get_spot_h1(now=now)
+    if h1 is None or len(h1) < 24 * 250:
+        logger.warning("Spot H1 feed unavailable or too short — skipping cycle.")
         return None
 
-    # Daily features (shifted 1 day)
-    d1['ema50'] = d1['close'].ewm(span=50, adjust=False).mean()
-    d1['ema200'] = d1['close'].ewm(span=200, adjust=False).mean()
-    d1['atr14'] = (d1['high'] - d1['low']).rolling(14).mean()
-    d1_prior = d1.iloc[-2]
+    feat = build_features(h1, fetch_dxy_daily())
+    idx = last_closed_index(feat, now)
+    if idx is None:
+        return None
 
-    # 4-Hour features (shifted 1 bar)
-    h4['ema50'] = h4['close'].ewm(span=50, adjust=False).mean()
-    h4['ema200'] = h4['close'].ewm(span=200, adjust=False).mean()
-    # Donchian over the 8 H4 bars BEFORE the last completed one (matches trader/features.py)
-    h4['h8'] = h4['high'].rolling(8).max().shift(1)
-    h4['l8'] = h4['low'].rolling(8).min().shift(1)
-    h4_prior = h4.iloc[-2]
+    age_h = (pd.Timestamp(now) - (feat["time"].iloc[idx] + pd.Timedelta(hours=1))).total_seconds() / 3600.0
+    if age_h > MAX_BAR_AGE_HOURS:
+        logger.warning(f"Spot feed is stale: last closed bar ended {age_h:.1f}h ago — skipping cycle.")
+        return None
 
-    # 1H features & Monday IB
-    h1['dow'] = h1['time'].dt.day_of_week
-    now_utc = datetime.now(pytz.UTC)
-    monday_bars = h1[(h1['dow'] == 0) & ((now_utc - h1['time']).dt.total_seconds() < 7 * 86400)]
-    mon_high = float(monday_bars['high'].max()) if len(monday_bars) > 0 else 0.0
-    mon_low = float(monday_bars['low'].min()) if len(monday_bars) > 0 else 0.0
+    return context_from_features(feat, idx)
 
-    # Score the last CLOSED H1 bar (Kraken's final bar is still forming), as in the backtest
-    latest_bar = h1.iloc[-2]
-    vol_ma20 = h1['volume'].rolling(20).mean().shift(1).iloc[-2]
-    vol_ratio = float(latest_bar['volume'] / max(vol_ma20, 0.001))
-    c_rng = max(float(latest_bar['high'] - latest_bar['low']), 0.01)
-    close_pct = float((latest_bar['close'] - latest_bar['low']) / c_rng)
-
-    dxy = fetch_dxy_signals()
-
-    return {
-        "h1": h1,
-        "latest_bar": latest_bar,
-        "d1_atr14": float(d1_prior['atr14']),
-        "d1_ema50": float(d1_prior['ema50']),
-        "d1_ema200": float(d1_prior['ema200']),
-        "h4_ema50": float(h4_prior['ema50']),
-        "h4_ema200": float(h4_prior['ema200']),
-        "h4_h8": float(h4_prior['h8']),
-        "h4_l8": float(h4_prior['l8']),
-        "mon_high": mon_high,
-        "mon_low": mon_low,
-        "vol_ratio": vol_ratio,
-        "close_pct": close_pct,
-        "dxy_bearish": dxy.get("dxy_bearish", False),
-        "dxy_bullish": dxy.get("dxy_bullish", False),
-        "dxy_close": dxy.get("dxy_close", 102.5)
-    }
-
-
-def _generate_simulated_tick():
-    """Fallback simulation with fixed imports"""
-    import random
-    base_price = 4505.0 
-    change = random.uniform(-1.0, 1.0)
-    new_price = base_price + change
-    spread = 0.40
-    return {
-        "bid": round(new_price - (spread / 2), 2),
-        "ask": round(new_price + (spread / 2), 2),
-        "spread": spread,
-        "time": datetime.now()
-    }
-
-def _generate_simulated_bars(count):
-    """Fallback simulation with fixed imports"""
-    import numpy as np
-    end_time = datetime.now(pytz.UTC)
-    # Using timedelta from the top-level import
-    start_time = end_time - timedelta(hours=count)
-    timestamps = pd.date_range(start=start_time, end=end_time, periods=count, tz='UTC')
-    base_price = 4505.0
-    prices = [base_price + np.random.normal(0, 5) for _ in range(count)]
-    df = pd.DataFrame({
-        'time': timestamps,
-        'open': prices,
-        'high': [p + 2 for p in prices],
-        'low': [p - 2 for p in prices],
-        'close': prices,
-        'volume': [500 for _ in range(count)]
-    })
-    return df
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    print("Testing Real-Time Price Feed via Kraken (PAXGUSD)...")
-    tick = get_tick()
-    print(f"Current Tick: {tick}")
-    
-    print("\nFetching Historical Bars...")
-    bars = get_bars(count=5)
-    if not bars.empty:
-        print(bars[['time', 'open', 'high', 'low', 'close']])
+    print("Testing spot XAU/USD feed (Dukascopy)...")
+    print(f"Tick: {get_tick()}")
+    bars = get_spot_h1(lookback_days=10)
+    if bars is not None:
+        print(bars.tail(5)[["time", "open", "high", "low", "close", "volume"]])
+    feat = build_features(get_spot_h1(), fetch_dxy_daily())
+    ctx = context_from_features(feat, len(feat) - 1)
+    print({k: v for k, v in ctx.items() if k not in ("features", "latest_bar")})

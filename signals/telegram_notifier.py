@@ -52,7 +52,9 @@ def send_status_update(status_type, details=None):
         emoji = "🚀"
         message = (
             f"{emoji} <b>Gold Institutional Sentinel Bot Started</b>\n"
-            f"<b>Strategy:</b> 8-Gate Confluence (84.2% Win Rate / 4.58 PF)\n"
+            f"<b>Strategy:</b> 8-Gate Confluence + paper-only Sweep & Reject test\n"
+            f"<b>Feed:</b> Spot XAU/USD H1 (Dukascopy) — same data as the backtest\n"
+            f"<b>Status:</b> No proven edge yet — forward test in progress\n"
             f"<b>Target:</b> Runner at 1.8x D1 ATR (TP1 at 0.55x ATR)\n"
             f"<b>Governor:</b> Max 1 High-Conviction Trade/Week\n"
             f"<b>Time:</b> {now_str} UTC"
@@ -130,9 +132,47 @@ def send_trade_card(res: dict) -> bool:
 
     lines.append("")
     lines.append("⚠️ <b>Weekend Rule:</b> Flat all open positions Friday 20:00 UTC (Zero Gap Risk)")
+    lines.append("ℹ️ <i>8-gate rules: +0.44R/trade in the 2023-26 tuning window, +0.03R over 2010-2026. "
+                 "Unproven — size accordingly.</i>")
     lines.append(f"🕒 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
 
     return send_telegram_message("\n".join(lines))
+
+
+def send_paper_signal(trade: dict, stats: dict = None) -> bool:
+    """Alert for a PAPER (forward-test) signal. Clearly marked as not a trade recommendation."""
+    emoji = "🟢" if trade["direction"] == "BUY" else "🔴"
+    entry, sl, tp = trade["entry_price"], trade["sl_price"], trade["tp_price"]
+    lines = [
+        "🧪 <b>PAPER SIGNAL — forward test, NOT a trade call</b>",
+        f"<b>Setup:</b> {trade['setup']}",
+        f"<b>Direction:</b> {emoji} {trade['direction']}",
+        f"<b>Swept level:</b> ${trade['swept_level']:,.2f} (prior-day {'low' if trade['direction'] == 'BUY' else 'high'})",
+        f"<b>Entry:</b> ${entry:,.2f}",
+        f"<b>Stop:</b> ${sl:,.2f} (1.0x D1 ATR = ${abs(entry - sl):.2f})",
+        f"<b>Target:</b> ${tp:,.2f} (1.5x D1 ATR)",
+        "<b>Exit rule:</b> stop, target, or flat Friday 20:00 UTC",
+        "",
+        "<i>Backtest 2010-2026: ~49% win, +0.07R/trade, not statistically proven. "
+        "Tracked automatically; judge after 50+ signals.</i>",
+    ]
+    if stats:
+        lines.append(f"📒 <b>Forward test so far:</b> {stats['closed']} closed, "
+                     f"{stats['wins']} wins, {stats['total_r']:+.2f}R total")
+    return send_telegram_message("\n".join(lines))
+
+
+def send_paper_result(trade: dict, status: str, exit_price: float, r_multiple: float, stats: dict) -> bool:
+    """Outcome of a paper trade plus the running scorecard."""
+    label = {"target": "🎯 Target hit", "stopped": "🛑 Stopped out", "time_exit": "⏱ Friday flat"}.get(status, status)
+    msg = (
+        f"🧪 <b>PAPER RESULT</b> — {trade['setup']}\n"
+        f"{label}: {trade['direction']} from ${trade['entry_price']:,.2f} → ${exit_price:,.2f} "
+        f"(<b>{r_multiple:+.2f}R</b>)\n"
+        f"📒 <b>Forward test:</b> {stats['closed']} closed, {stats['wins']} wins, "
+        f"{stats['total_r']:+.2f}R total, {stats['avg_r']:+.3f}R avg"
+    )
+    return send_telegram_message(msg)
 
 
 def send_signal_alert(result, trade_result=None):

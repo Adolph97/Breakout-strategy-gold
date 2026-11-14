@@ -1,0 +1,12 @@
+.git
+.venv
+**/__pycache__
+**/.DS_Store
+logs
+storage/*.db
+# Local research export, old versions and backtest artifacts are not needed by the bot
+trader
+gold_v2
+gold.json
+backtest_results_*.json
+*.md

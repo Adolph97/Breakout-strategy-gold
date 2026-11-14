@@ -14,8 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash app
+# Create non-root user for security. It must own the app directory (logs/) and the
+# database directory, which docker-compose mounts as a volume SEPARATE from the code.
+RUN useradd --create-home --shell /bin/bash app \
+    && mkdir -p /app/logs /app/db_data \
+    && chown -R app:app /app
+ENV GOLD_DB_PATH=/app/db_data/gold_trader.db
 USER app
 
 # Set working directory

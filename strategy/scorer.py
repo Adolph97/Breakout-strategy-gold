@@ -3,7 +3,9 @@ strategy/scorer.py
 ------------------
 Unified 8-Gate Confluence Engine for Gold (XAU/USD).
 Enforces the complete Institutional Sentinel Strategy:
-  - Backtest (2023-07/2026, ATR-scaled rules): 27 trades, 74% win, +0.44R/trade, PF 1.75.
+  - Backtest, tuned window (2023 to Jul-2026): 27 trades, 74% win, +0.44R/trade.
+  - Same rules on 2010 to Nov-2026: 98 trades, +0.03R/trade (t = 0.4). NO DEMONSTRATED EDGE
+    outside the tuned window, and -0.27R on the 5 trades after it. Treat signals as unproven.
   - 2-Stage Asymmetric Exits (distances scale with the prior day's D1 ATR):
       Stage 1 (0.55 x ATR): Bank 50% volume & move Stop Loss to Breakeven.
       Stage 2 (1.8 x ATR): 50% Runner target.
@@ -75,7 +77,8 @@ def get_session_name(utc_dt=None) -> str:
     return "Off-Session"
 
 
-def score(tick_data=None, bars_df=None, cot_data=None, news_data=None, webhook_signal=None, context=None):
+def score(tick_data=None, bars_df=None, cot_data=None, news_data=None, webhook_signal=None, context=None,
+          governor_ok=None):
     """
     Evaluates the complete 8-Gate Confluence Engine.
     Accepts direct multi-timeframe context or fetches from data.price_feed.
@@ -88,7 +91,7 @@ def score(tick_data=None, bars_df=None, cot_data=None, news_data=None, webhook_s
     if context is None:
         try:
             from data.price_feed import get_multi_timeframe_context
-            context = get_multi_timeframe_context()
+            context = get_multi_timeframe_context() or {}
         except Exception as e:
             logger.warning(f"Could not load multi-timeframe context: {e}")
             context = {}
@@ -156,7 +159,8 @@ def score(tick_data=None, bars_df=None, cot_data=None, news_data=None, webhook_s
     volume_ok = vol_ratio >= MIN_VOL_RATIO
 
     # ── GATE 8: Weekly Governor (Max 1 trade / week) ──
-    governor_ok = check_weekly_governor()
+    if governor_ok is None:
+        governor_ok = check_weekly_governor()
 
     # Evaluate Confluences
     long_gates_passed = [
@@ -169,16 +173,17 @@ def score(tick_data=None, bars_df=None, cot_data=None, news_data=None, webhook_s
     ]
 
     # Stop must sit inside the backtested band; outside it the backtest SKIPS the setup (it never clamps)
-    def stop_ok(sl):
-        dist = abs(entry_ref - sl)
+    # The stop must also be on the losing side of the entry (below for longs, above for shorts).
+    def stop_ok(sl, side):
+        dist = side * (entry_ref - sl)
         return h4_e50 > 0 and SL_MIN_ATR * d1_atr <= dist <= SL_MAX_ATR * d1_atr
 
     sl_long_raw  = h4_e50 - H4_BUFFER_ATR * d1_atr
     sl_short_raw = h4_e50 + H4_BUFFER_ATR * d1_atr
-    stop_band_ok = stop_ok(sl_long_raw) if macro_bull else (stop_ok(sl_short_raw) if macro_bear else False)
+    stop_band_ok = stop_ok(sl_long_raw, 1) if macro_bull else (stop_ok(sl_short_raw, -1) if macro_bear else False)
 
-    actionable_buy  = all(long_gates_passed) and stop_ok(sl_long_raw)
-    actionable_sell = all(short_gates_passed) and stop_ok(sl_short_raw)
+    actionable_buy  = all(long_gates_passed) and stop_ok(sl_long_raw, 1)
+    actionable_sell = all(short_gates_passed) and stop_ok(sl_short_raw, -1)
 
     action = "STAND_BY"
     direction = None
